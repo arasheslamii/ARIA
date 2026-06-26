@@ -1,0 +1,14 @@
+#!/bin/sh
+# postrm — packaged files (/opt/aria, /usr/bin/aria, the systemd unit) are removed
+# by dpkg automatically. The user's per-user config/state (~/.config/aria and
+# ~/.local/share/aria, including the API key) live in HOME and are intentionally
+# left in place — even on purge, since root can't know which user owns them.
+set -e
+
+case "$1" in
+    remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        : # nothing extra to clean up
+        ;;
+esac
+
+exit 0

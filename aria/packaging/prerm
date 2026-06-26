@@ -1,0 +1,12 @@
+#!/bin/sh
+# prerm — best-effort stop of the running user service before removal. Run as
+# root we can't always reach the user's session bus, so failures are ignored;
+# users are advised to `aria disable` first. dpkg removes the packaged files.
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop aria.service >/dev/null 2>&1 || true
+    systemctl --user disable aria.service >/dev/null 2>&1 || true
+fi
+
+exit 0

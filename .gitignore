@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.deb
+# Bundled models are fetched/placed by the build, not committed.
+aria/packaging/models/*.onnx
+aria/packaging/models/*.onnx.json
+# Local runtime state (never commit user data or secrets)
+.aria-local/
+*.sqlite3
+*.log

@@ -1,0 +1,25 @@
+# systemd *user* service so Aria runs in the background and listens for the wake
+# word, firing alarms even with no terminal open. As a user service it shares
+# your login session's PipeWire audio (no system-service audio headaches).
+#
+# Install/enable (the `aria` CLI wraps these):
+#     aria enable          # == systemctl --user enable --now aria.service
+#     aria status / logs / stop / disable
+[Unit]
+Description=Aria — voice-first AI assistant (background daemon)
+# Wait for the user audio session so we don't crash-loop at login; the daemon
+# also retries the mic with backoff as a belt-and-suspenders.
+After=default.target sound.target pipewire.service pipewire-pulse.service wireplumber.service
+Wants=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aria daemon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+# Aria reads its key from the OS keyring or, when that's unavailable under
+# `systemd --user`, the encrypted-at-rest fallback file in the state dir.
+
+[Install]
+WantedBy=default.target

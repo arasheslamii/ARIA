@@ -1,0 +1,20 @@
+#!/bin/sh
+# postinst — deliberately lightweight. NO model downloads here (they're bundled),
+# and we never enable the user service from root; the user runs `aria enable`.
+set -e
+
+echo "Aria installed."
+echo "  1) aria setup     # store your Groq API key"
+echo "  2) aria           # talk to her"
+echo "  3) aria enable    # run her in the background on every login"
+
+# Refresh desktop/icon caches so the Aria app entry + notification icon show up.
+# All best-effort; never fail the install.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+
+exit 0

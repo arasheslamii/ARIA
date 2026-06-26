@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Aria
+GenericName=Voice Assistant
+Comment=Fast, agentic, voice-first AI assistant
+Exec=aria
+Icon=aria
+Terminal=true
+Categories=Utility;Accessibility;
+Keywords=voice;assistant;ai;speech;

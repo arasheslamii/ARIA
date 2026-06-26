@@ -1,0 +1,97 @@
+[project]
+name = "aria-assistant"
+version = "0.1.1"
+description = "Aria — a fast, agentic, voice-first AI assistant for Linux."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Aria contributors" }]
+
+# Keep this list aligned with ARCHITECTURE.md. Providers are swappable; heavy
+# optional backends (faster-whisper/torch) live under the [project.optional]
+# extras so the default install stays lean and the .deb stays small.
+dependencies = [
+    # LLM + networking
+    "groq>=0.13",
+    "httpx>=0.27",
+    # Audio I/O + DSP
+    "sounddevice>=0.4.7",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    # TTS (local, no GPU)
+    "piper-tts>=1.2",
+    "onnxruntime>=1.17",
+    # VAD + wake word (local)
+    "openwakeword>=0.6",
+    # Tooling / MCP
+    "mcp>=1.1",
+    # TUI
+    "textual>=0.79",
+    "rich>=13.7",
+    # Config + secrets + platform
+    "keyring>=25",
+    "tomlkit>=0.13",
+    "pydantic>=2.7",
+    "platformdirs>=4.2",
+    "python-dateutil>=2.9",
+    "aiosqlite>=0.20",
+    # Notifications (timers/alarms/reminders)
+    "desktop-notifier>=5.0",
+    # Deep research: extract the main article text from a fetched web page.
+    "trafilatura>=1.8",
+    "beautifulsoup4>=4.12",
+]
+
+[project.optional-dependencies]
+# The native voice stack for live mic/speaker use. `uv pip install -e ".[voice]"`
+# pulls everything needed to run `aria` against real hardware. Heaviest item is
+# torch (for Silero VAD); the pipeline degrades to an energy VAD without it, so
+# install ".[voice-lite]" for a fast, torch-free setup.
+voice = [
+    "sounddevice>=0.4.7",   # PortAudio bindings (needs system libportaudio2)
+    "piper-tts>=1.2",       # local TTS
+    "onnxruntime>=1.17",    # piper + openWakeWord inference
+    "openwakeword>=0.6",    # local wake word
+    "faster-whisper>=1.0",  # local STT fallback
+    "silero-vad>=5.1",      # accurate VAD (pulls torch)
+    "torch>=2.2",
+]
+voice-lite = [
+    "sounddevice>=0.4.7",
+    "piper-tts>=1.2",
+    "onnxruntime>=1.17",
+    "openwakeword>=0.6",
+    "faster-whisper>=1.0",
+]
+# Local STT fallback alone (pulls ctranslate2).
+local-stt = ["faster-whisper>=1.0"]
+# Silero VAD alone (torch). The pipeline falls back to an energy VAD without it.
+silero = ["torch>=2.2", "silero-vad>=5.1"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
+
+[project.scripts]
+aria = "aria.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aria"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+disallow_untyped_defs = false
+plugins = []
