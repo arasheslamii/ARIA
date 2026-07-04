@@ -79,6 +79,10 @@ class ToolExecutor:
         )
 
     def _log(self, tool: Tool, args: dict, risk: str, outcome: str, *, confirmed: bool) -> None:
+        # Never write private content (email/calendar bodies) to the audit trail —
+        # record only which argument fields were present, not their values.
+        if getattr(tool, "sensitive", False):
+            args = {"_redacted_fields": sorted(args)}
         try:
             self._audit.record(
                 tool=tool.name, arguments=args, risk=risk, outcome=outcome, confirmed=confirmed

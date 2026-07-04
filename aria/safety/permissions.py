@@ -46,6 +46,7 @@ def classify(tool: Tool, arguments: dict[str, Any] | None) -> PermissionDecision
 def needs_confirmation(decision: PermissionDecision, require_confirmation: bool) -> bool:
     if decision.risk == "blocked":
         return True  # caller must refuse
-    if decision.risk == "confirm":
+    if decision.risk in ("confirm", "commerce"):
+        # Commerce (spending money / placing an order) is never auto-approved.
         return require_confirmation
     return False

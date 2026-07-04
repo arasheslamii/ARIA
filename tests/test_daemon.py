@@ -20,6 +20,14 @@ from aria.core.service import control_command, logs_command, run_control
 from aria.voice.audio import AudioError
 
 
+def _dummy_request():
+    """A minimal httpx.Request so we can construct a real groq.APIConnectionError
+    (its __init__ requires a request) the way the SDK raises one at boot."""
+    import httpx
+
+    return httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+
+
 # --- single-instance lock -------------------------------------------------
 def test_single_instance_lock(tmp_path):
     path = tmp_path / "daemon.lock"
@@ -60,9 +68,39 @@ def test_run_control_uses_runner():
     calls: list[list[str]] = []
     rc = run_control("enable", runner=lambda cmd: calls.append(cmd) or 0)
     assert rc == 0
-    assert calls == [["systemctl", "--user", "enable", "--now", "aria.service"]]
+    # enable turns on linger (so Aria boots without a login) THEN enables the unit.
+    assert calls == [
+        ["loginctl", "enable-linger"],
+        ["systemctl", "--user", "enable", "--now", "aria.service"],
+    ]
     run_control("logs", runner=lambda cmd: calls.append(cmd) or 0)
     assert calls[-1][0] == "journalctl"
+
+
+def test_enable_linger_is_best_effort_and_non_fatal():
+    from aria.core.service import enable_linger_command
+
+    assert enable_linger_command() == ["loginctl", "enable-linger"]
+
+    # If loginctl is missing the runner raises — `aria enable` must NOT fail; the
+    # systemctl enable still runs and we return its code.
+    seen: list[list[str]] = []
+
+    def flaky(cmd):
+        seen.append(cmd)
+        if cmd[0] == "loginctl":
+            raise FileNotFoundError("no loginctl")
+        return 0
+
+    rc = run_control("enable", runner=flaky)
+    assert rc == 0
+    assert ["systemctl", "--user", "enable", "--now", "aria.service"] in seen
+
+
+def test_other_actions_do_not_touch_linger():
+    calls: list[list[str]] = []
+    run_control("start", runner=lambda cmd: calls.append(cmd) or 0)
+    assert calls == [["systemctl", "--user", "start", "aria.service"]]  # no linger
 
 
 # --- mic retry loop -------------------------------------------------------
@@ -93,6 +131,72 @@ async def test_mic_retry_stops_on_fatal_error():
 
     await asyncio.wait_for(run_with_mic_retry(Pipe(), lambda t: None, stop), timeout=2)
     assert stop.is_set()  # unrecoverable -> signals the daemon to exit, no loop
+
+
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        pytest.param(lambda: __import__("aria.llm.base", fromlist=["LLMConnectionError"])
+                     .LLMConnectionError("dns"), id="normalized"),
+        pytest.param(
+            lambda: __import__("groq").APIConnectionError(request=_dummy_request()),
+            id="raw-groq",
+        ),
+        pytest.param(lambda: OSError(-2, "Name or service not known"), id="gaierror"),
+    ],
+)
+async def test_mic_retry_survives_connection_error_and_keeps_looping(monkeypatch, exc_factory):
+    # BOOT case: WiFi/DNS isn't up yet. A connection error must back off and RETRY,
+    # never stop the daemon (otherwise Aria looks dead right after a reboot).
+    monkeypatch.setattr("aria.core.daemon._MAX_BACKOFF_S", 0.01)
+    attempts = {"n": 0}
+    stop = asyncio.Event()
+
+    class Pipe:
+        async def run(self, _respond):
+            attempts["n"] += 1
+            if attempts["n"] >= 3:  # "network came up" -> let the test end the loop
+                stop.set()
+            raise exc_factory()
+
+    await asyncio.wait_for(run_with_mic_retry(Pipe(), lambda t: None, stop), timeout=2)
+    assert attempts["n"] >= 3  # kept retrying through the offline window
+
+
+async def test_mic_retry_survives_rate_limit(monkeypatch):
+    from aria.llm.base import LLMRateLimitError
+
+    # Rate-limit is retryable (with a long floor), never fatal.
+    monkeypatch.setattr("aria.core.daemon._MAX_BACKOFF_S", 0.01)
+    monkeypatch.setattr("aria.core.daemon._RATE_LIMIT_FLOOR_S", 0.01)
+    attempts = {"n": 0}
+    stop = asyncio.Event()
+
+    class Pipe:
+        async def run(self, _respond):
+            attempts["n"] += 1
+            if attempts["n"] >= 2:
+                stop.set()
+            raise LLMRateLimitError("429 daily cap")
+
+    await asyncio.wait_for(run_with_mic_retry(Pipe(), lambda t: None, stop), timeout=2)
+    assert attempts["n"] >= 2  # stayed up across the cap instead of exiting
+
+
+def test_classify_failure_buckets():
+    import groq
+
+    from aria.app import MissingSecret
+    from aria.core.daemon import classify_failure
+    from aria.llm.base import LLMAuthError, LLMConnectionError, LLMRateLimitError
+
+    assert classify_failure(LLMAuthError("bad")) == "fatal"
+    assert classify_failure(MissingSecret("no key")) == "fatal"
+    assert classify_failure(LLMRateLimitError("429")) == "ratelimit"
+    assert classify_failure(LLMConnectionError("down")) == "connection"
+    assert classify_failure(groq.APIConnectionError(request=_dummy_request())) == "connection"
+    assert classify_failure(OSError(-2, "Name or service not known")) == "connection"
+    assert classify_failure(ValueError("???")) == "unknown"
 
 
 # --- full daemon lifecycle: clean shutdown on SIGINT ----------------------
@@ -154,3 +258,6 @@ def test_service_file_parses():
     assert cp.get("Service", "ExecStart").endswith("aria daemon")
     assert cp.get("Service", "Restart") == "on-failure"
     assert cp.get("Install", "WantedBy") == "default.target"
+    # Don't start before the network is up (DNS not ready right after a reboot).
+    assert "network-online.target" in cp.get("Unit", "After")
+    assert "network-online.target" in cp.get("Unit", "Wants")

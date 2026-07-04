@@ -27,14 +27,16 @@ PYBIN="$(command -v python3.11 || command -v python3.12 || command -v python3)"
 echo "==> Aria ${VERSION} (${ARCH}); base python: ${PYBIN}"
 
 echo "==> Staging in $PKG"
-mkdir -p "$PKG/opt/aria/models" "$PKG/usr/bin" "$PKG/DEBIAN" \
+mkdir -p "$PKG/opt/aria/models" "$PKG/opt/aria/scripts" "$PKG/usr/bin" "$PKG/DEBIAN" \
          "$PKG/usr/lib/systemd/user" "$PKG/usr/share/applications" \
          "$PKG/usr/share/icons/hicolor/scalable/apps"
 
 echo "==> Building bundled venv with the voice stack"
 uv venv "$PKG/opt/aria/venv" --python "$PYBIN"
 VENV_PY="$PKG/opt/aria/venv/bin/python"
-uv pip install --python "$VENV_PY" "$REPO"
+# Bundle faster-whisper too, so LOCAL mode (Ollama) has fully on-device speech-to-
+# text and the "local = no Groq key" promise holds without a cloud STT fallback.
+uv pip install --python "$VENV_PY" "$REPO" "faster-whisper>=1.0"
 
 echo "==> Bundling Piper voice ($VOICE)"
 if [ ! -f "$HERE/models/$VOICE.onnx" ]; then
@@ -56,6 +58,12 @@ from openwakeword.utils import download_models
 download_models([sys.argv[1]])
 print("  wakeword + feature models cached in the bundled venv")
 PY
+
+echo "==> Bundling the commerce-engine fallback installer"
+# The documented manual fallback for `aria install-commerce`: installs the
+# food-ordering browser engine into the bundled venv. Shipped, not run.
+install -m 755 "$REPO/scripts/install_commerce.sh" "$PKG/opt/aria/scripts/install_commerce.sh"
+install -m 755 "$REPO/scripts/install_local.sh" "$PKG/opt/aria/scripts/install_local.sh"
 
 echo "==> Launcher + systemd user unit + desktop entry/icon"
 install -m 755 "$HERE/aria-launcher.sh" "$PKG/usr/bin/aria"

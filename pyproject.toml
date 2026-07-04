@@ -1,6 +1,6 @@
 [project]
 name = "aria-assistant"
-version = "0.1.1"
+version = "0.8.0"
 description = "Aria — a fast, agentic, voice-first AI assistant for Linux."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,8 +18,10 @@ dependencies = [
     "sounddevice>=0.4.7",
     "soundfile>=0.12",
     "numpy>=1.26",
-    # TTS (local, no GPU)
+    # TTS (local, no GPU). Piper is the lean bundled default; Kokoro is the
+    # natural-prosody upgrade (model files fetched by the wizard on demand).
     "piper-tts>=1.2",
+    "kokoro-onnx>=0.4",
     "onnxruntime>=1.17",
     # VAD + wake word (local)
     "openwakeword>=0.6",
@@ -40,6 +42,10 @@ dependencies = [
     # Deep research: extract the main article text from a fetched web page.
     "trafilatura>=1.8",
     "beautifulsoup4>=4.12",
+    # Google Calendar + Gmail (pure-Python, so it bundles in the .deb — no Node).
+    "google-api-python-client>=2.100",
+    "google-auth>=2.30",
+    "google-auth-oauthlib>=1.2",
 ]
 
 [project.optional-dependencies]
@@ -49,8 +55,9 @@ dependencies = [
 # install ".[voice-lite]" for a fast, torch-free setup.
 voice = [
     "sounddevice>=0.4.7",   # PortAudio bindings (needs system libportaudio2)
-    "piper-tts>=1.2",       # local TTS
-    "onnxruntime>=1.17",    # piper + openWakeWord inference
+    "piper-tts>=1.2",       # local TTS (lean default)
+    "kokoro-onnx>=0.4",     # local TTS (natural-prosody upgrade)
+    "onnxruntime>=1.17",    # piper + kokoro + openWakeWord inference
     "openwakeword>=0.6",    # local wake word
     "faster-whisper>=1.0",  # local STT fallback
     "silero-vad>=5.1",      # accurate VAD (pulls torch)
@@ -59,10 +66,15 @@ voice = [
 voice-lite = [
     "sounddevice>=0.4.7",
     "piper-tts>=1.2",
+    "kokoro-onnx>=0.4",
     "onnxruntime>=1.17",
     "openwakeword>=0.6",
     "faster-whisper>=1.0",
 ]
+# Agentic web ordering (Stage: "buy me a pizza"). Heavy + optional, so it is NOT
+# bundled in the .deb — install on demand: `pip install 'aria-assistant[commerce]'`
+# then `playwright install chromium`. Drives a real Chromium and STOPS at payment.
+commerce = ["browser-use>=0.1", "playwright>=1.40", "langchain-openai>=0.1"]
 # Local STT fallback alone (pulls ctranslate2).
 local-stt = ["faster-whisper>=1.0"]
 # Silero VAD alone (torch). The pipeline falls back to an energy VAD without it.

@@ -9,6 +9,6 @@ APP_NAME = "Aria"
 APP_SLUG = "aria"  # used for config dirs, binaries, dbus ids, etc.
 APP_TAGLINE = "your voice, actually heard"
 
-__version__ = "0.1.1"
+__version__ = "0.8.0"
 
 __all__ = ["APP_NAME", "APP_SLUG", "APP_TAGLINE", "__version__"]

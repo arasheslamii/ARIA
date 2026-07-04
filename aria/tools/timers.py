@@ -13,12 +13,33 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime, timedelta
+from datetime import time as dt_time
 from typing import Any
 
 from dateutil import parser as dateparser
 
 from aria.core.scheduler import SchedulerService
 from aria.tools.base import Tool, ToolError, ToolResult
+
+_WEEKDAYS = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2, "weds": 2, "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+}
+# Longest names first so "wednesday" wins over "wed".
+_WEEKDAY_RE = re.compile(
+    r"\b(" + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")\b"
+)
+
+
+def _upcoming_weekday(now_dt: datetime, weekday: int, force_next: bool):
+    """The date of the next given weekday (today if it matches and not 'next')."""
+    days_ahead = (weekday - now_dt.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7 if force_next else 0
+    elif force_next:
+        days_ahead += 7
+    return (now_dt + timedelta(days=days_ahead)).date()
 
 _UNIT_SECONDS = {"s": 1, "sec": 1, "second": 1, "m": 60, "min": 60, "minute": 60,
                  "h": 3600, "hr": 3600, "hour": 3600}
@@ -66,7 +87,18 @@ def parse_when(text: str, now: float | None = None) -> tuple[float, str]:
     if recurrence.startswith("interval:"):
         return now_ts + float(recurrence.split(":", 1)[1]), recurrence
 
+    # Resolve the target DATE: an explicit weekday ("Friday", "next Monday"),
+    # "tomorrow", or today — anchored to the REAL current local date.
     day_offset = 1 if "tomorrow" in t else 0
+    force_next = bool(re.search(r"\bnext\b", t))
+    wm = _WEEKDAY_RE.search(t)
+    weekday = _WEEKDAYS[wm.group(1)] if wm else None
+    if weekday is not None:
+        base_date = _upcoming_weekday(now_dt, weekday, force_next)
+        explicit_date = True
+    else:
+        base_date = (now_dt + timedelta(days=day_offset)).date()
+        explicit_date = day_offset > 0
 
     # Explicit clock time. We only treat a bare number as o'clock when there's an
     # am/pm, explicit minutes, the word "at", or a daily/weekly recurrence — so we
@@ -82,15 +114,22 @@ def parse_when(text: str, now: float | None = None) -> tuple[float, str]:
             hour = 0
         if hour > 23 or minute > 59:
             raise ToolError(f"could not understand time: {text!r}")
-        target = (now_dt + timedelta(days=day_offset)).replace(
-            hour=hour, minute=minute, second=0, microsecond=0
-        )
-        if target <= now_dt and day_offset == 0:  # already passed today -> next day
+        target = datetime.combine(base_date, dt_time(hour, minute))
+        if target <= now_dt and not explicit_date:  # passed today, no explicit date
             target += timedelta(days=1)
+        elif target <= now_dt and weekday is not None:  # that weekday already passed
+            target += timedelta(days=7)
         return target.timestamp(), recurrence
 
-    # Fallback: named dates ("June 25 3pm", "next monday").
-    cleaned = re.sub(r"\b(remind me|remind|set|to|at|tomorrow)\b", " ", t).strip()
+    # A date but no time (e.g. "Friday", "tomorrow") -> default to 9am.
+    if explicit_date:
+        target = datetime.combine(base_date, dt_time(9, 0))
+        if target <= now_dt:
+            target += timedelta(days=7 if weekday is not None else 1)
+        return target.timestamp(), recurrence
+
+    # Fallback: named dates ("June 25 3pm").
+    cleaned = re.sub(r"\b(remind me|remind|set|to|at|tomorrow|next)\b", " ", t).strip()
     try:
         when_dt = dateparser.parse(cleaned, default=now_dt, fuzzy=True)
     except (ValueError, OverflowError) as exc:

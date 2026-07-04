@@ -6,8 +6,6 @@ import asyncio
 import time
 from datetime import datetime
 
-import pytest
-
 from aria.core.scheduler import SchedulerService, _next_wallclock
 from aria.tools.timers import (
     ManageTimersTool,
@@ -61,8 +59,10 @@ async def test_fire_announces_and_notifies(tmp_path):
 
 async def test_fire_without_name_is_still_natural(tmp_path):
     spoken: list[str] = []
-    s = SchedulerService(db_path=tmp_path / "a.db", announce=spoken.append, name_provider=lambda: None,
-                         now=lambda: 10.0)
+    s = SchedulerService(
+        db_path=tmp_path / "a.db", announce=spoken.append,
+        name_provider=lambda: None, now=lambda: 10.0,
+    )
     await s.open()
     await s.add("tea", 5.0, "none")
     await s._fire((await s.list_active())[0])
@@ -145,6 +145,26 @@ def test_parse_when_variants():
     fa, rec = parse_when("tomorrow at 7", now=base)
     when = datetime.fromtimestamp(fa)
     assert rec == "none" and when.hour == 7 and when.day == 25
+
+
+def test_parse_when_weekdays():
+    base = datetime(2026, 6, 24, 12, 0, 0).timestamp()  # Wednesday 24 June 2026
+
+    # "Friday at 3pm" must anchor to the UPCOMING Friday (26th), not today.
+    when = datetime.fromtimestamp(parse_when("Friday at 3pm", now=base)[0])
+    assert when.weekday() == 4 and when.day == 26 and when.hour == 15
+
+    # Bare weekday -> that day, default 9am.
+    when = datetime.fromtimestamp(parse_when("friday", now=base)[0])
+    assert when.weekday() == 4 and when.day == 26 and when.hour == 9
+
+    # "next monday" -> Monday of the following week (6 July), not the coming one.
+    when = datetime.fromtimestamp(parse_when("next monday", now=base)[0])
+    assert when.weekday() == 0 and when.day == 6 and when.month == 7
+
+    # A weekday that already passed today rolls a week (Wed said on Wed afternoon).
+    when = datetime.fromtimestamp(parse_when("Wednesday at 9am", now=base)[0])
+    assert when.weekday() == 2 and when.day == 1 and when.month == 7  # next Wed
 
 
 # --- tools end-to-end -----------------------------------------------------

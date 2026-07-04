@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 import numpy as np
 import pytest
 
-from aria.llm.base import ChatResult, LLMProvider, Message, ToolCall
+from aria.llm.base import ChatResult, LLMProvider
 from aria.voice.audio import Microphone, Speaker
 from aria.voice.base import STT, TTS, AudioChunk
 

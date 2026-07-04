@@ -30,6 +30,8 @@ _ENV_FALLBACK = {
     "groq_api_key": "GROQ_API_KEY",
     "openai_api_key": "OPENAI_API_KEY",
     "anthropic_api_key": "ANTHROPIC_API_KEY",
+    "fallback_api_key": "ARIA_FALLBACK_API_KEY",
+    "commerce_api_key": "ARIA_COMMERCE_API_KEY",  # free Gemini AI Studio key
 }
 
 
@@ -138,23 +140,33 @@ class SecretStore:
             return kv
         return self._file.get(name)
 
-    def set(self, name: str, value: str) -> str:
-        """Store ``value`` and return the backend that actually persisted it:
-        "keyring", "file", or "none" (caller should then warn the user)."""
+    def set(self, name: str, value: str, *, durable: bool = False) -> str:
+        """Store ``value`` and return the backend that persisted it ("keyring",
+        "file", or "none").
+
+        ``durable=True`` ALSO writes the machine-bound encrypted file even when the
+        keyring accepts the write — needed for secrets with no env fallback that
+        must be readable from the systemd --user daemon (whose keyring may differ
+        from the interactive session that wrote them, e.g. the Google token).
+        """
         try:
             keyring.set_password(self.service, name, value)
         except Exception:  # noqa: BLE001 - never raise on set; we verify below
             pass
-        # Verify it actually persisted — some sessions silently no-op.
-        if self._keyring_get(name) == value:
+        keyring_ok = self._keyring_get(name) == value
+
+        file_ok = False
+        if durable or not keyring_ok:  # always file on durable, or as fallback
+            try:
+                self._file.set(name, value)
+                file_ok = self._file.get(name) == value
+            except OSError:
+                pass
+
+        if keyring_ok:
             return "keyring"
-        # Keyring didn't stick — use the encrypted file fallback.
-        try:
-            self._file.set(name, value)
-            if self._file.get(name) == value:
-                return "file"
-        except OSError:
-            pass
+        if file_ok:
+            return "file"
         return "none"
 
     def delete(self, name: str) -> None:

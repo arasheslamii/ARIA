@@ -74,8 +74,10 @@ async def test_risky_tool_dropped_on_no(tmp_path):
     await _drain(orch.respond("email bob"))
     reply = "".join([d async for d in orch.respond("no")])
     assert not tool.ran  # declined -> never executed
-    # Clean acknowledgement, not a confusing freeform model reply.
-    assert "won't" in reply.lower()
+    # Clean acknowledgement (from the varied pool), not a freeform model reply.
+    from aria.core import lines
+
+    assert reply in lines.DECLINED
     await mem.close()
 
 
@@ -121,7 +123,7 @@ async def test_lock_screen_asks_and_defers_until_yes(tmp_path):
     )
 
     first = "".join([d async for d in orch.respond("lock my screen")])
-    assert "yes or no" in first.lower()
+    assert "go ahead" in first.lower()  # asked for confirmation (varied frame)
     assert not tool.ran  # crucial: nothing executed before confirmation
 
     await _drain(orch.respond("yes"))
@@ -148,7 +150,7 @@ async def test_no_arg_confirm_tool_with_none_arguments_does_not_crash(tmp_path):
     )
 
     first = "".join([d async for d in orch.respond("lock my screen")])
-    assert "yes or no" in first.lower()
+    assert "go ahead" in first.lower()  # asked for confirmation (varied frame)
     assert not tool.ran
     await _drain(orch.respond("yes"))
     assert tool.ran

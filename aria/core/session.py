@@ -65,7 +65,9 @@ async def build_voice_session(
 
     managers: list = []
     try:
-        orch, managers = await build_orchestrator(config, secrets, memory, scheduler=scheduler)
+        orch, managers = await build_orchestrator(
+            config, secrets, memory, scheduler=scheduler, voice=True
+        )
         await orch.warm_up()
         stt = build_stt(config, secrets)
         tts = build_tts(config)
@@ -81,6 +83,31 @@ async def build_voice_session(
     wake = make_wakeword(
         config.wakeword.enabled, config.wakeword.model, config.wakeword.threshold
     )
+
+    # Hold-to-talk (activation mode hotkey/hybrid). If the key can't be watched
+    # (no evdev / no input-group access), degrade to wake word and say why —
+    # Aria must never come up deaf.
+    import logging
+
+    activation = config.activation
+    hotkey = None
+    if activation.mode in ("hotkey", "hybrid"):
+        from aria.voice.hotkey import HotkeyListener
+
+        listener = HotkeyListener(activation.hotkey)
+        if await listener.start():
+            hotkey = listener
+            managers.append(listener)
+        else:
+            logging.getLogger("aria").warning(
+                "Hold-to-talk unavailable (%s)%s.",
+                listener.reason,
+                " — falling back to wake-word activation"
+                if activation.mode == "hotkey" else "",
+            )
+            if activation.mode == "hotkey":
+                activation = activation.model_copy(update={"mode": "wake_word"})
+
     pipeline = VoicePipeline(
         stt=stt,
         tts=tts,
@@ -92,6 +119,15 @@ async def build_voice_session(
         on_state=on_state,
         on_transcript=on_transcript,
         on_latency=on_latency,
+        # Hold the floor for the user's reply (e.g. a yes/no after a confirmation):
+        # re-open the mic with no wake word while the orchestrator is awaiting one.
+        awaiting_reply=lambda: orch.awaiting_reply,
         announcements=announcements,
+        # Conversation mode: the mic re-opens after every answer; the orchestrator's
+        # fast-model gate drops background speech so she never butts in uninvited.
+        conversation_cfg=config.conversation,
+        followup_filter=orch.accept_followup,
+        activation_cfg=activation,
+        hotkey=hotkey,
     )
     return VoiceSession(pipeline, orch, scheduler, memory, announcements, managers)

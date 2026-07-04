@@ -20,6 +20,7 @@ from groq import (
     AuthenticationError,
     BadRequestError,
     PermissionDeniedError,
+    RateLimitError,
 )
 
 from aria.llm.base import (
@@ -27,6 +28,7 @@ from aria.llm.base import (
     LLMAuthError,
     LLMConnectionError,
     LLMProvider,
+    LLMRateLimitError,
     Message,
     ToolCall,
     ToolSpec,
@@ -44,6 +46,8 @@ _FUNC_NAME_RE = re.compile(r"<\s*function\s*=\s*([A-Za-z0-9_.\-]+)")
 def _translate(exc: Exception) -> Exception:
     """Map Groq SDK errors to provider-agnostic ones so the runtime can show a
     friendly message instead of leaking a raw traceback."""
+    if isinstance(exc, RateLimitError):
+        return LLMRateLimitError(str(exc))
     if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
         return LLMAuthError(str(exc))
     if isinstance(exc, APIConnectionError):

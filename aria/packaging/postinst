@@ -7,6 +7,12 @@ echo "Aria installed."
 echo "  1) aria setup     # store your Groq API key"
 echo "  2) aria           # talk to her"
 echo "  3) aria enable    # run her in the background on every login"
+echo
+echo "Optional — agentic food ordering ('order me a pizza'): install the browser"
+echo "engine once (kept out of this package to stay lean):"
+echo "  aria install-commerce      # or say yes when 'aria setup' offers to install it"
+echo "Then add a free Gemini key (aistudio.google.com) and your delivery address in"
+echo "'aria setup'. She fills the cart and STOPS at payment — you always pay yourself."
 
 # Refresh desktop/icon caches so the Aria app entry + notification icon show up.
 # All best-effort; never fail the install.

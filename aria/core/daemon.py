@@ -19,11 +19,15 @@ import signal
 from contextlib import suppress
 from pathlib import Path
 
+import groq
+import httpx
+
 from aria.app import MissingSecret
 from aria.config.loader import state_dir
 from aria.config.schema import AriaConfig
 from aria.core.runtime import friendly_error
 from aria.core.session import build_voice_session
+from aria.llm.base import LLMAuthError, LLMConnectionError, LLMRateLimitError
 from aria.voice.audio import AudioError
 
 log = logging.getLogger("aria.daemon")
@@ -31,6 +35,46 @@ log = logging.getLogger("aria.daemon")
 _LOCK_NAME = "daemon.lock"
 _LOG_NAME = "aria.log"
 _MAX_BACKOFF_S = 30.0
+# A rate-limit (free-tier daily cap) won't clear in seconds — wait at least this
+# long before retrying so we don't hammer the API, but never exit the daemon.
+_RATE_LIMIT_FLOOR_S = 60.0
+
+# Network/DNS failures the daemon should ride out (NOT exit) — at boot the WiFi
+# often isn't up yet, and a mid-session blip must never kill a long-lived daemon.
+# We match both our normalized LLMConnectionError and the RAW provider/transport
+# types, because some paths (e.g. Groq Whisper STT in stt_groq) call the client
+# directly and don't translate their exceptions.
+_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+    LLMConnectionError,
+    groq.APIConnectionError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    OSError,  # socket.gaierror "Name or service not known" when DNS isn't ready
+)
+
+
+def classify_failure(exc: BaseException) -> str:
+    """Bucket a voice-loop exception by how the daemon should react:
+
+    * ``"fatal"`` — unrecoverable (bad/missing API key); stop the daemon, since
+      retrying can't fix it.
+    * ``"ratelimit"`` — provider rate-limited; back off a long floor and keep
+      looping (the cap clears on its own).
+    * ``"connection"`` — network/DNS unreachable; back off and keep looping (the
+      WiFi/boot case and transient blips).
+    * ``"unknown"`` — unexpected crash; log with a traceback, back off, keep going.
+
+    Only ``"fatal"`` ends the daemon — everything else is retryable so a transient
+    network problem at boot can't make Aria look dead.
+    """
+    if isinstance(exc, (LLMAuthError, MissingSecret)):
+        return "fatal"
+    if isinstance(exc, LLMRateLimitError):
+        return "ratelimit"
+    if isinstance(exc, _CONNECTION_ERRORS):
+        return "connection"
+    return "unknown"
 
 
 def log_path() -> Path:
@@ -88,9 +132,11 @@ async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
 
 
 async def run_with_mic_retry(pipeline, respond, stop: asyncio.Event) -> None:
-    """Run the voice loop, retrying audio-device failures with backoff so a not-
-    yet-ready mic at login doesn't crash the service. Fatal, unrecoverable errors
-    (bad key, offline) are logged once and stop the loop rather than crash-loop."""
+    """Run the voice loop, retrying transient failures with backoff so the daemon
+    never looks dead/flapping. A not-yet-ready mic, a network/DNS hiccup (common in
+    the first seconds after a reboot, before WiFi is up), or a rate-limit all back
+    off and keep looping. ONLY a genuinely unrecoverable startup error (bad/missing
+    key) stops the loop — see :func:`classify_failure`."""
     backoff = 1.0
     while not stop.is_set():
         try:
@@ -104,14 +150,30 @@ async def run_with_mic_retry(pipeline, respond, stop: asyncio.Event) -> None:
             await _sleep_or_stop(stop, backoff)
             backoff = min(backoff * 2, _MAX_BACKOFF_S)
         except BaseException as exc:  # noqa: BLE001
-            friendly = friendly_error(exc)
-            if friendly is not None:
-                log.error("%s", friendly)
-                stop.set()  # not recoverable by retrying — let the daemon exit
+            kind = classify_failure(exc)
+            if kind == "fatal":
+                log.error("%s", friendly_error(exc) or exc)
+                stop.set()  # retrying can't fix a bad key — let the daemon exit
                 return
-            log.exception("Voice loop crashed; restarting in %.0fs.", backoff)
-            await _sleep_or_stop(stop, backoff)
-            backoff = min(backoff * 2, _MAX_BACKOFF_S)
+            if kind == "ratelimit":
+                wait = max(backoff, _RATE_LIMIT_FLOOR_S)
+                log.warning(
+                    "Hit the API usage limit (%s); backing off %.0fs and staying up.",
+                    exc, wait,
+                )
+                await _sleep_or_stop(stop, wait)
+                backoff = min(backoff * 2, _MAX_BACKOFF_S)
+            elif kind == "connection":
+                log.warning(
+                    "Network not reachable yet (%s); retrying in %.0fs (staying up).",
+                    exc, backoff,
+                )
+                await _sleep_or_stop(stop, backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF_S)
+            else:  # unknown crash — keep the daemon alive but capture the traceback
+                log.exception("Voice loop crashed; restarting in %.0fs.", backoff)
+                await _sleep_or_stop(stop, backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF_S)
 
 
 async def run_daemon(config: AriaConfig) -> int:
@@ -128,8 +190,14 @@ async def run_daemon(config: AriaConfig) -> int:
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
+    def _log_latency(from_speech_end: float, from_wake: float) -> None:
+        log.info(
+            "Turn latency: %.1fs from end of speech to first audio (%.1fs from wake).",
+            from_speech_end, from_wake,
+        )
+
     try:
-        session = await build_voice_session(config)
+        session = await build_voice_session(config, on_latency=_log_latency)
     except MissingSecret:
         log.error("No Groq API key found. Run `aria setup` once, then `aria enable`.")
         lock.release()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable
+from contextlib import suppress
 
 SERVICE = "aria.service"
 
@@ -35,7 +36,22 @@ def logs_command(*, follow: bool = True, lines: int = 200) -> list[str]:
     return cmd
 
 
+def enable_linger_command() -> list[str]:
+    """Enable *linger* for the current user so their systemd --user manager — and
+    therefore Aria — starts at BOOT, before (or without) a graphical login.
+
+    Without linger, ``systemctl --user enable`` only starts Aria when the user logs
+    in interactively, so after a headless reboot she'd look dead. ``aria enable``
+    runs as the user, so no arg is needed (enables linger for self)."""
+    return ["loginctl", "enable-linger"]
+
+
 def run_control(action: str, *, runner: Callable[[list[str]], int] = subprocess.call) -> int:
     """Run a control action. ``action`` is one of the _CONTROL keys or 'logs'."""
+    if action == "enable":
+        # Best-effort and idempotent: turn on linger so Aria auto-starts at boot
+        # without a login. Never fail `aria enable` if loginctl is absent/denied.
+        with suppress(Exception):
+            runner(enable_linger_command())
     cmd = logs_command() if action == "logs" else control_command(action)
     return int(runner(cmd))

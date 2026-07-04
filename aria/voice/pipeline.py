@@ -14,18 +14,29 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
 from enum import Enum, auto
 
 import numpy as np
 
-from aria.config.schema import AudioConfig, VADConfig, WakeWordConfig
+from aria.config.schema import (
+    ActivationConfig,
+    AudioConfig,
+    ConversationConfig,
+    VADConfig,
+    WakeWordConfig,
+)
 from aria.voice.audio import Microphone, Speaker
 from aria.voice.base import STT, TTS, VAD, AudioChunk, WakeWord
+from aria.voice.chime import make_chime
 from aria.voice.sentencizer import sentence_chunks
 
 # A `respond` takes the transcript and yields assistant text deltas.
 RespondFn = Callable[[str], AsyncIterator[str]]
+# Decides whether a conversation-window capture was really meant for Aria (vs the
+# TV / a side conversation). Only applied to NON-confirmation follow-up captures.
+FollowupFilter = Callable[[str], Awaitable[bool]]
 
 # Barge-in requires this much CONTINUOUS over-speech before stopping playback.
 # Generous (vs ~90ms) because X11 has no acoustic echo cancellation, so Aria's
@@ -47,11 +58,39 @@ _AUDIO_GAP_S = 0.4
 _ECHO_FACTOR = 2.5
 _ECHO_FLOOR = 0.02
 
+# When Aria finishes a turn that expects a reply (a pending confirmation), she
+# re-opens the mic WITHOUT the wake word and listens for the user's answer for this
+# long. If no one starts talking by then, she falls back to wake-word IDLE — the
+# pending state is kept, so a later "hey jarvis, yes" still resumes. Kept short:
+# past a few seconds an open mic feels like surveillance, not attentiveness.
+_FOLLOWUP_WINDOW_S = 4.0
+
+# How a capture began — drives whether the follow-up relevance filter applies.
+# "wake" and "confirm" captures are always for Aria; "conversation" captures (the
+# open mic after an ordinary answer) might be background speech, so they're gated.
+_ORIGIN_WAKE = "wake"
+_ORIGIN_CONFIRM = "confirm"
+_ORIGIN_CONVERSATION = "conversation"
+_ORIGIN_PTT = "ptt"  # push-to-talk: capture runs exactly while the key is held
+
+# Minimum VOICED frames before a capture is transcribed at all. Whisper
+# HALLUCINATES text ("Thank you.") on captures that are mostly silence, so a
+# lone keyboard click or chair squeak that flips one VAD frame must never reach
+# STT — nor may a false wake that's followed by 20s of pure silence. Wake and
+# confirmation captures were explicitly user-initiated, so their bar is low;
+# the always-open conversation window demands real sustained speech.
+_MIN_VOICED_FRAMES = 3  # ~90ms of speech (wake / confirmation captures)
+_MIN_VOICED_FRAMES_CONVO = 8  # ~240ms of speech (open-mic conversation window)
+
 
 def _rms(frame: np.ndarray) -> float:
     if frame.size == 0:
         return 0.0
     return float(np.sqrt(np.mean(np.square(frame, dtype=np.float64))))
+
+
+async def _one_frame(pcm: np.ndarray) -> AsyncIterator[np.ndarray]:
+    yield pcm
 
 
 class State(Enum):
@@ -75,7 +114,12 @@ class VoicePipeline:
         on_state: Callable[[State], None] | None = None,
         on_transcript: Callable[[str], None] | None = None,
         on_latency: Callable[[float, float], None] | None = None,
+        awaiting_reply: Callable[[], bool] | None = None,
         announcements: asyncio.Queue[str] | None = None,
+        conversation_cfg: ConversationConfig | None = None,
+        followup_filter: FollowupFilter | None = None,
+        activation_cfg: ActivationConfig | None = None,
+        hotkey=None,  # anything with a `pressed: bool` (see aria.voice.hotkey)
         mic: Microphone | None = None,
         speaker: Speaker | None = None,
     ) -> None:
@@ -90,6 +134,31 @@ class VoicePipeline:
         self._on_transcript = on_transcript or (lambda _t: None)
         # on_latency(end_of_speech_to_first_word, wake_to_first_word) in seconds.
         self._on_latency = on_latency or (lambda _a, _b: None)
+        # Returns True when the just-finished turn expects the user's reply, so we
+        # re-open the mic without a wake word. Default: never (plain turn-taking).
+        self._awaiting_reply = awaiting_reply or (lambda: False)
+        # Conversation mode: when enabled, the mic re-opens after EVERY answer (not
+        # only confirmations), so back-and-forth needs no wake word. None = off
+        # (plain turn-taking, as before).
+        self._conversation = conversation_cfg
+        self._followup_filter = followup_filter
+        # How the current/last capture started (wake word vs follow-up window).
+        self._capture_origin = _ORIGIN_WAKE
+        # Push-to-talk: `hotkey.pressed` is polled once per audio frame. While a
+        # PTT capture runs, the key RELEASE (not silence) ends it.
+        self._hotkey = hotkey
+        self._ptt_hold = False
+        # Wake-word spotting is off in pure hotkey mode (activation_cfg says so).
+        self._wake_active = activation_cfg is None or activation_cfg.mode != "hotkey"
+        # The "I'm listening" earcon, pre-rendered at the speaker's rate. None
+        # (e.g. in tests without an activation config) = silent activation.
+        self._chime_pcm = (
+            make_chime(tts.sample_rate)
+            if activation_cfg is not None and activation_cfg.chime
+            else None
+        )
+        # Deadline (perf_counter) for follow-up listening; 0.0 when not in it.
+        self._followup_deadline = 0.0
         # Proactive-speech channel: the scheduler (and later briefings) push text
         # here; we speak it ONLY when idle so it never collides with a user turn.
         self._announcements = announcements
@@ -129,18 +198,50 @@ class VoicePipeline:
         collected: list[np.ndarray] = []
         started = False
         trailing = 0
+        voiced = 0
         barge = 0
+        ptt_prev = False
         speak_task: asyncio.Task | None = None
+
+        # The daemon RE-ENTERS this loop after a mid-turn crash (a network error
+        # during STT, a dead speaker, …). The previous run may have died with the
+        # machine in THINKING or SPEAKING — states this loop only ever LEAVES, so
+        # without a reset every frame would be ignored forever: alive but deaf
+        # until a reboot. Always start a run from a clean IDLE.
+        self._ptt_hold = False
+        self._followup_deadline = 0.0
+        self._reset_idle()
 
         try:
             async for frame in self.mic.frames():
+                ptt_now = self._ptt_pressed()
+                ptt_edge = ptt_now and not ptt_prev
+                ptt_prev = ptt_now
+
                 if self.state is State.IDLE:
-                    if self._wake_triggered(frame, sr):
+                    if ptt_edge:
+                        # Push-to-talk: capture for exactly as long as the key is
+                        # held; the release is the endpoint (no VAD guessing).
                         self._t_wake = time.perf_counter()
+                        self._followup_deadline = 0.0
+                        self._capture_origin = _ORIGIN_PTT
+                        self._ptt_hold = True
                         self._set_state(State.LISTENING)
                         collected = [frame]
                         started = self.vad.is_speech(frame, sr)
                         trailing = 0
+                        voiced = 1 if started else 0
+                        await self._ack()
+                    elif self._wake_active and self._wake_triggered(frame, sr):
+                        self._t_wake = time.perf_counter()
+                        self._followup_deadline = 0.0  # wake-driven, not a follow-up
+                        self._capture_origin = _ORIGIN_WAKE
+                        self._set_state(State.LISTENING)
+                        collected = [frame]
+                        started = self.vad.is_speech(frame, sr)
+                        trailing = 0
+                        voiced = 1 if started else 0
+                        await self._ack()
                     elif (announcement := self._pop_announcement()) is not None:
                         # Proactive speech: only ever started while idle, so it
                         # can't collide with a user turn. Spoken via the same
@@ -150,25 +251,69 @@ class VoicePipeline:
                         barge = 0
 
                 elif self.state is State.LISTENING:
+                    if ptt_now and not self._ptt_hold:
+                        # Key pressed inside an open follow-up window: adopt PTT
+                        # semantics — hold the mic for as long as the key is down.
+                        self._ptt_hold = True
+                        self._capture_origin = _ORIGIN_PTT
+                        self._followup_deadline = 0.0
+                    if self._ptt_hold:
+                        collected.append(frame)
+                        if self.vad.is_speech(frame, sr):
+                            voiced += 1
+                        if (not ptt_now) or len(collected) >= max_frames:
+                            self._ptt_hold = False
+                            speak_task = await self._end_capture(
+                                collected, voiced, sr, respond
+                            )
+                            if speak_task is None:
+                                self._reset_idle()
+                            else:
+                                barge = 0
+                        continue
+                    # Follow-up mode: if we re-opened the mic for a reply and the
+                    # user hasn't started talking within the window, fall back to
+                    # wake-word IDLE (the pending state is kept for "hey jarvis, yes").
+                    if (
+                        not started
+                        and self._followup_deadline
+                        and time.perf_counter() > self._followup_deadline
+                    ):
+                        self._followup_deadline = 0.0
+                        collected = []
+                        self._reset_idle()
+                        continue
                     collected.append(frame)
                     if self.vad.is_speech(frame, sr):
                         started = True
                         trailing = 0
+                        voiced += 1
                     elif started:
                         trailing += 1
                     if (started and trailing >= silence_frames) or len(collected) >= max_frames:
-                        speak_task = await self._end_capture(collected, sr, respond)
+                        self._followup_deadline = 0.0
+                        speak_task = await self._end_capture(collected, voiced, sr, respond)
                         if speak_task is None:
                             self._reset_idle()
                         else:
                             barge = 0
 
                 elif self.state is State.SPEAKING:
+                    if ptt_edge:
+                        # The key always means "stop talking and listen to me":
+                        # cut playback; the finished speak task re-opens the mic.
+                        self.speaker.stop()
                     barge, should_stop = self._barge_check(frame, sr, barge)
                     if should_stop:
                         self.speaker.stop()
                     if speak_task is not None and speak_task.done():
-                        self._finish_speaking(speak_task)
+                        if self._finish_speaking(speak_task):
+                            # Re-armed into follow-up LISTENING: start a fresh capture
+                            # so the user's answer isn't mixed with stale frames.
+                            collected = []
+                            started = False
+                            trailing = 0
+                            voiced = 0
                         speak_task = None
         finally:
             # Let any in-flight reply finish (so it isn't left suspended).
@@ -177,6 +322,19 @@ class VoicePipeline:
                     await speak_task
                 except BaseException:  # noqa: BLE001 - shutdown best-effort
                     pass
+
+    def _ptt_pressed(self) -> bool:
+        return bool(self._hotkey is not None and getattr(self._hotkey, "pressed", False))
+
+    async def _ack(self) -> None:
+        """Play the short 'I'm listening' chime (never fatal — it's cosmetic)."""
+        if self._chime_pcm is None:
+            return
+        try:
+            self.speaker.reset()
+            await self.speaker.play(_one_frame(self._chime_pcm))
+        except Exception:  # noqa: BLE001 - a broken speaker mustn't kill the loop
+            pass
 
     def _wake_triggered(self, frame: np.ndarray, sr: int) -> bool:
         if not self.wake_cfg.enabled:
@@ -217,21 +375,40 @@ class VoicePipeline:
         self._set_state(State.IDLE)
 
     async def _end_capture(
-        self, collected: list[np.ndarray], sr: int, respond: RespondFn
+        self, collected: list[np.ndarray], voiced: int, sr: int, respond: RespondFn
     ) -> asyncio.Task | None:
         """Transcribe the captured utterance and, if non-empty, kick off speaking
         as a background task. Returns the speak task (or None to go back to idle)."""
         self._t_capture_end = time.perf_counter()
         self._set_state(State.THINKING)
+        need = (
+            _MIN_VOICED_FRAMES_CONVO
+            if self._capture_origin == _ORIGIN_CONVERSATION
+            else _MIN_VOICED_FRAMES
+        )
+        if voiced < need:
+            return None  # essentially silence — Whisper would hallucinate a phrase
         pcm = np.concatenate(collected) if collected else np.zeros(0, "float32")
         if pcm.size < sr // 4:  # < 0.25s -> noise, ignore
             return None
         transcript = (await self.stt.transcribe(AudioChunk(pcm, sr))).strip()
         if not transcript:
             return None
+        if not await self._meant_for_us(transcript):
+            return None  # background speech in the open-mic window — ignore it
         self._on_transcript(transcript)
         self._begin_speaking()
         return asyncio.create_task(self._speak(respond, transcript))
+
+    async def _meant_for_us(self, transcript: str) -> bool:
+        """Gate conversation-window captures through the relevance filter. Wake-word
+        and confirmation-reply captures are always accepted (they're explicit)."""
+        if self._capture_origin != _ORIGIN_CONVERSATION or self._followup_filter is None:
+            return True
+        try:
+            return await self._followup_filter(transcript)
+        except Exception:  # noqa: BLE001 - fail open: never eat a real user turn
+            return True
 
     def _begin_speaking(self) -> None:
         """Enter SPEAKING for a fresh utterance: clear any stale barge-in stop
@@ -248,9 +425,37 @@ class VoicePipeline:
         except asyncio.QueueEmpty:
             return None
 
-    def _finish_speaking(self, speak_task: asyncio.Task) -> None:
+    def _finish_speaking(self, speak_task: asyncio.Task) -> bool:
+        """Resolve a finished speak task. If the turn left Aria expecting a reply
+        (a pending confirmation) — or conversation mode is on — re-open the mic
+        immediately in follow-up LISTENING mode with no wake word and return True.
+        Otherwise go IDLE and return False.
+
+        TTS has fully finished by the time the speak task is done, so arming the mic
+        here can't capture the tail of her own question (no acoustic echo)."""
+        speak_task.result()  # re-raise a fatal reply error (e.g. auth) first
+        if self._awaiting_reply():
+            self._begin_followup_listen(_ORIGIN_CONFIRM, _FOLLOWUP_WINDOW_S)
+            return True
+        if self._conversation is not None and self._conversation.enabled:
+            # Keep the conversation flowing: no wake word needed to continue. The
+            # relevance filter protects against background speech being answered.
+            self._begin_followup_listen(_ORIGIN_CONVERSATION, self._conversation.window_s)
+            return True
         self._reset_idle()
-        speak_task.result()  # re-raise a fatal reply error (e.g. auth) to the runtime
+        return False
+
+    def _begin_followup_listen(self, origin: str, window_s: float) -> None:
+        """Re-arm capture as if a wake word just fired, so the user can answer
+        naturally. The run loop resets its capture buffers; we reset VAD/wake and
+        timing (so wake→first-word latency stays meaningful) and start the window."""
+        self.wakeword.reset()
+        self.vad.reset()
+        now = time.perf_counter()
+        self._t_wake = now
+        self._capture_origin = origin
+        self._followup_deadline = now + window_s
+        self._set_state(State.LISTENING)
 
     async def _speak(self, respond: RespondFn, transcript: str) -> None:
         """Produce the reply and stream it to TTS. Never reads the microphone;
@@ -266,14 +471,44 @@ class VoicePipeline:
         await self._stream_to_tts(_one())
 
     async def _stream_to_tts(self, deltas: AsyncIterator[str]) -> None:
+        """Synthesize and play sentence chunks with one chunk of lookahead: while
+        a chunk is playing, the NEXT one is already synthesizing in the background.
+        Kokoro runs below real time on CPU, so the previous synth-then-play-then-
+        synth serialization left an audible gap before every chunk."""
         sentences = sentence_chunks(deltas)
+        queue: asyncio.Queue[list[np.ndarray] | None] = asyncio.Queue(maxsize=1)
+
+        async def synth_ahead() -> None:
+            try:
+                async for sentence in sentences:
+                    if self.speaker.interrupted:
+                        break
+                    frames = [f async for f in self.tts.synthesize(sentence)]
+                    await queue.put(frames)
+            finally:
+                await queue.put(None)
+
+        producer = asyncio.create_task(synth_ahead())
         report_latency = True
-        async for sentence in sentences:
-            if self.speaker.interrupted:
-                break
-            frames_out = self._track_audio(self.tts.synthesize(sentence), report_latency)
-            report_latency = False
-            await self.speaker.play(frames_out)
+        try:
+            while (frames := await queue.get()) is not None:
+                if self.speaker.interrupted:
+                    continue  # barge-in: drain remaining chunks unplayed
+                await self.speaker.play(self._replay(frames, report_latency))
+                report_latency = False
+            await producer  # surface a synth error (missing voice etc.) to the turn
+        finally:
+            if not producer.done():
+                producer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await producer
+
+    def _replay(self, frames: list[np.ndarray], report_latency: bool):
+        async def _iter() -> AsyncIterator[np.ndarray]:
+            for f in frames:
+                yield f
+
+        return self._track_audio(_iter(), report_latency)
 
     async def _track_audio(
         self, frames: AsyncIterator[np.ndarray], report_latency: bool

@@ -8,12 +8,13 @@ several in parallel) without knowing the internals.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from aria.llm.base import LLMProvider, Message, ToolCall, assistant, system, tool_result, user
 from aria.tools.base import Tool, ToolRegistry, ToolResult
 
-_MAX_STEPS = 4
+_MAX_STEPS = 5
 
 
 class SubAgent:
@@ -48,8 +49,11 @@ class SubAgent:
             if not result.tool_calls:
                 return result.content
             messages.append(assistant(result.content, result.tool_calls))
-            for call in result.tool_calls:
-                messages.append(tool_result(call.id, await self._invoke(call)))
+            # Run this step's tool calls concurrently — reading several articles in
+            # parallel is what keeps multi-source research usable for voice.
+            outputs = await asyncio.gather(*(self._invoke(c) for c in result.tool_calls))
+            for call, out in zip(result.tool_calls, outputs, strict=True):
+                messages.append(tool_result(call.id, out, name=call.name))
         # Out of steps: ask for a final summary with no tools.
         final = await self.llm.chat(messages, model=self.model, temperature=0.3)
         return final.content

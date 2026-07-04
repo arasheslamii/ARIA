@@ -175,3 +175,252 @@ def test_research_prompt_drives_read_and_cite():
 
     low = _RESEARCH_PROMPT.lower()
     assert "read_webpage" in low and "cite" in low and "synthesize" in low
+
+
+# --- PART A: strict grounding + multi-source + headlines + parallel -------
+def test_research_prompt_enforces_grounding():
+    from aria.agents.specialists import _RESEARCH_PROMPT
+
+    low = _RESEARCH_PROMPT.lower()
+    # Only fetched facts; attribute to outlet; decline gaps; never use memory.
+    assert "only" in low and "fetched" in low
+    assert "attribute" in low
+    assert "say so" in low  # decline when sources don't cover it
+    assert "memory" in low and "never" in low
+    # Headlines-first overview: 5-10 real headlines by outlet.
+    assert "5-10" in _RESEARCH_PROMPT and "outlet" in low
+
+
+def test_orchestrator_prompt_enforces_grounding():
+    from aria.core.prompts import ORCHESTRATOR_SYSTEM
+
+    low = ORCHESTRATOR_SYSTEM.lower()
+    assert "grounding" in low
+    assert "fetched this turn" in low or "fetched" in low
+    assert "stale" in low  # don't answer current events from memory
+
+
+async def test_research_agent_reads_multiple_sources():
+    from tests.conftest import FakeLLM
+
+    reader = _FakeRead()
+    queue = [
+        ChatResult(content="", tool_calls=[ToolCall("c1", "web_search", {"query": "news"})]),
+        # One step, TWO read_webpage calls -> must run in parallel.
+        ChatResult(
+            content="",
+            tool_calls=[
+                ToolCall("c2", "read_webpage", {"url": "https://ex.com/a"}),
+                ToolCall("c3", "read_webpage", {"url": "https://ex.com/b"}),
+            ],
+        ),
+        ChatResult(content="Two outlets agree markets fell. (BBC, Reuters.)"),
+    ]
+    agent = SubAgent(
+        name="research", description="d", system_prompt="p",
+        tools=[_FakeSearch(), reader], llm=FakeLLM(chat_queue=queue), model="big",
+    )
+    res = await SubAgentTool(agent).run(task="what's the news")
+    assert set(reader.read_urls) == {"https://ex.com/a", "https://ex.com/b"}  # read BOTH
+    urls = {s["url"] for s in res.data["sources"]}
+    assert {"https://ex.com/a", "https://ex.com/b"} <= urls  # both surfaced
+
+
+async def test_subagent_runs_tool_calls_in_parallel():
+    # Two reads in one step must execute concurrently — proven with a barrier that
+    # only releases when BOTH have started. Sequential execution would deadlock.
+    import asyncio
+
+    from tests.conftest import FakeLLM
+
+    barrier = asyncio.Barrier(2)
+
+    class _BarrierRead(Tool):
+        name = "read_webpage"
+        description = "read"
+        parameters = {"type": "object", "properties": {"url": {"type": "string"}}}
+        risk = "safe"
+
+        def __init__(self):
+            self.urls: list[str] = []
+
+        async def run(self, **kwargs):
+            self.urls.append(kwargs["url"])
+            await barrier.wait()  # both calls must arrive here together
+            return ToolResult(content="read", data={"url": kwargs["url"]})
+
+    reader = _BarrierRead()
+    queue = [
+        ChatResult(
+            content="",
+            tool_calls=[
+                ToolCall("a", "read_webpage", {"url": "u1"}),
+                ToolCall("b", "read_webpage", {"url": "u2"}),
+            ],
+        ),
+        ChatResult(content="done"),
+    ]
+    agent = SubAgent(
+        name="r", description="d", system_prompt="p",
+        tools=[reader], llm=FakeLLM(chat_queue=queue), model="big",
+    )
+    # Deadlocks (TimeoutError) if the two reads run sequentially.
+    await asyncio.wait_for(agent.handle("read both"), timeout=3)
+    assert set(reader.urls) == {"u1", "u2"}
+
+
+async def test_go_deeper_on_second_source_reads_that_url():
+    from aria.core.memory import Memory
+    from aria.core.orchestrator import Orchestrator
+    from aria.tools.base import ToolRegistry
+
+    reader = _FakeRead()
+    reg = ToolRegistry()
+    reg.register(reader)
+    state = {"n": 0}
+
+    class LLM:
+        async def chat(self, messages, *, model, tools=None, temperature=None, max_tokens=None):
+            if model == "small":
+                return ChatResult(
+                    content='{"route":"tool","needs_tools":["read_webpage"],"reason":"x"}'
+                )
+            state["n"] += 1
+            if state["n"] == 1:
+                return ChatResult(
+                    content="", tool_calls=[ToolCall("r", "read_webpage", {"url": "https://ex.com/b"})]
+                )
+            return ChatResult(content="That one says markets recovered.")
+
+        async def stream(self, messages, *, model, temperature=None, max_tokens=None):
+            yield "That one says markets recovered."
+
+    mem = Memory(":memory:")
+    await mem.open()
+    orch = Orchestrator(
+        llm=LLM(), registry=reg, memory=mem, reasoning_model="big", fast_model="small"
+    )
+    orch._last_sources = [
+        {"title": "Markets dip", "url": "https://ex.com/a"},
+        {"title": "Other take", "url": "https://ex.com/b"},
+    ]
+    _ = "".join([d async for d in orch.respond("go deeper on the second one")])
+    await mem.close()
+    assert reader.read_urls == ["https://ex.com/b"]  # mapped #2 -> the right URL
+
+
+# --- FIX 1: research agent runs on the REASONING model, not the 8B --------
+def test_research_agent_uses_reasoning_model():
+    from aria.agents.specialists import build_specialists
+
+    class _L:  # never called
+        async def chat(self, *a, **k): ...
+        async def stream(self, *a, **k):
+            yield ""
+
+    agents = {a.name: a for a in build_specialists(_L(), "REASON-70B", "FAST-8B", [])}
+    assert agents["agent_research"]._agent.model == "REASON-70B"  # the fix
+    assert agents["agent_files"]._agent.model == "REASON-70B"  # multi-step too
+    assert agents["agent_compute"]._agent.model == "FAST-8B"  # trivial stays fast
+
+
+# --- FIX 2: get_headlines parses real RSS into outlet+url headlines --------
+_RSS = (
+    '<?xml version="1.0"?><rss version="2.0"><channel>'
+    + "".join(
+        f"<item><title>Headline {i}</title><link>https://outlet/{i}</link></item>"
+        for i in range(4)
+    )
+    + "</channel></rss>"
+)
+
+
+async def test_get_headlines_overview_returns_real_headlines(monkeypatch):
+    from aria.tools.web import GetHeadlinesTool
+
+    async def fake_get(self, url, **kwargs):
+        return httpx.Response(200, text=_RSS, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    res = await GetHeadlinesTool().run()  # overview
+    results = res.data["results"]
+    assert len(results) >= 5  # 5-10 real headlines
+    assert all(r.get("url") and r.get("outlet") and r.get("title") for r in results)
+    assert ":" in res.content.splitlines()[0]  # attributed "Outlet: title"
+
+
+async def test_get_headlines_category_alias(monkeypatch):
+    from aria.tools.web import GetHeadlinesTool
+
+    seen_urls: list[str] = []
+
+    async def fake_get(self, url, **kwargs):
+        seen_urls.append(str(url))
+        return httpx.Response(200, text=_RSS, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    res = await GetHeadlinesTool().run(category="sports")  # alias -> sport
+    assert res.data["results"]
+    assert all("sport" in u for u in seen_urls)  # only sport feeds queried
+
+
+# --- FIX 4: a failed/empty fetch is honest, NEVER invented ----------------
+async def test_get_headlines_all_feeds_fail_is_honest(monkeypatch):
+    from aria.tools.web import GetHeadlinesTool
+
+    async def boom(self, url, **kwargs):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", boom)
+    with pytest.raises(ToolError, match="couldn't pull the headlines"):
+        await GetHeadlinesTool().run()
+
+
+def test_prompts_forbid_inventing_on_tool_error():
+    from aria.agents.specialists import _RESEARCH_PROMPT
+    from aria.core.prompts import ORCHESTRATOR_SYSTEM
+
+    for text in (_RESEARCH_PROMPT.lower(), ORCHESTRATOR_SYSTEM.lower()):
+        assert "error:" in text  # references errored tool results
+        assert "never" in text and ("invent" in text or "fabricate" in text)
+
+
+# --- FIX 2/3: headlines populate _last_sources for "go deeper" -------------
+async def test_news_headlines_populate_sources(monkeypatch):
+    from aria.core.memory import Memory
+    from aria.core.orchestrator import Orchestrator
+    from aria.tools.base import ToolRegistry
+    from aria.tools.web import GetHeadlinesTool
+
+    async def fake_get(self, url, **kwargs):
+        return httpx.Response(200, text=_RSS, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    reg = ToolRegistry()
+    reg.register(GetHeadlinesTool())
+    state = {"n": 0}
+
+    class LLM:
+        async def chat(self, messages, *, model, tools=None, temperature=None, max_tokens=None):
+            if model == "small":
+                return ChatResult(
+                    content='{"route":"tool","needs_tools":["get_headlines"],"reason":"x"}'
+                )
+            state["n"] += 1
+            if state["n"] == 1:
+                return ChatResult(content="", tool_calls=[ToolCall("h", "get_headlines", {})])
+            return ChatResult(content="Here are the top stories.")
+
+        async def stream(self, messages, *, model, temperature=None, max_tokens=None):
+            yield "Here are the top stories."
+
+    mem = Memory(":memory:")
+    await mem.open()
+    orch = Orchestrator(
+        llm=LLM(), registry=reg, memory=mem, reasoning_model="big", fast_model="small"
+    )
+    _ = "".join([d async for d in orch.respond("what's the news")])
+    await mem.close()
+    assert len(orch._last_sources) >= 5  # real headline URLs stored for follow-ups
+    assert all(s["url"].startswith("https://") for s in orch._last_sources)

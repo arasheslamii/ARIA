@@ -72,7 +72,9 @@ async def test_turn_never_ends_silent():
         reasoning_model="big", fast_model="small",
     )
     spoken = "".join([d async for d in orch.respond("uhhh")])
-    assert spoken.strip() == _NO_RESPONSE_FALLBACK
+    from aria.core import lines
+
+    assert spoken.strip() in lines.NO_RESPONSE  # varied pool, never silent
     # And it was persisted as the assistant turn.
-    assert (await mem.recent_turns())[-1] == ("assistant", _NO_RESPONSE_FALLBACK)
+    assert (await mem.recent_turns())[-1] == ("assistant", spoken.strip())
     await mem.close()

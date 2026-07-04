@@ -27,6 +27,10 @@ class LLMConnectionError(LLMError):
     """The provider could not be reached (network/DNS/timeout)."""
 
 
+class LLMRateLimitError(LLMError):
+    """The provider rate-limited the request (e.g. Groq's free daily cap)."""
+
+
 @dataclass
 class ToolCall:
     """A model's request to invoke a tool. ``arguments`` is ALWAYS a dict."""

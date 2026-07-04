@@ -7,10 +7,12 @@
 #     aria status / logs / stop / disable
 [Unit]
 Description=Aria — voice-first AI assistant (background daemon)
-# Wait for the user audio session so we don't crash-loop at login; the daemon
-# also retries the mic with backoff as a belt-and-suspenders.
-After=default.target sound.target pipewire.service pipewire-pulse.service wireplumber.service
-Wants=sound.target
+# Wait for the user audio session AND network readiness so we don't crash-loop at
+# login/boot (DNS isn't up the instant WiFi associates). For --user units the
+# network-online.target ordering is best-effort, so the daemon ALSO treats a
+# connection error as retryable (backs off, never exits) as the real guarantee.
+After=default.target sound.target network-online.target pipewire.service pipewire-pulse.service wireplumber.service
+Wants=sound.target network-online.target
 
 [Service]
 Type=simple
@@ -20,6 +22,11 @@ RestartSec=5
 TimeoutStopSec=10
 # Aria reads its key from the OS keyring or, when that's unavailable under
 # `systemd --user`, the encrypted-at-rest fallback file in the state dir.
+# Inherit the graphical session env so a headful browser (food ordering) can show
+# on the user's X11/Wayland display. On Cinnamon/X11 the session normally exports
+# these to the --user manager already; this makes the dependency explicit. If
+# there's still no display, web ordering degrades with a spoken "I need your screen".
+PassEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY
 
 [Install]
 WantedBy=default.target

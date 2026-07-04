@@ -19,7 +19,7 @@ from aria.config.schema import AriaConfig
 from aria.core.memory import Memory
 from aria.core.scheduler import SchedulerService, desktop_notify
 from aria.core.session import build_voice_session
-from aria.llm.base import LLMAuthError, LLMConnectionError
+from aria.llm.base import LLMAuthError, LLMConnectionError, LLMRateLimitError
 from aria.voice.pipeline import State
 
 console = Console()
@@ -28,11 +28,16 @@ _BAD_KEY_MSG = (
     "Your Groq API key looks invalid or missing — run `aria setup` to fix it."
 )
 _OFFLINE_MSG = "I couldn't reach Groq — check your internet connection and try again."
+_RATE_LIMIT_MSG = (
+    "I've hit my usage limit for the moment — let's try again in a few minutes."
+)
 
 
 def friendly_error(exc: BaseException) -> str | None:
     """Map an exception to a one-line user message, or None if it isn't one we
     handle gracefully (caller should then let it propagate)."""
+    if isinstance(exc, LLMRateLimitError):
+        return _RATE_LIMIT_MSG
     if isinstance(exc, (LLMAuthError, MissingSecret)):
         return _BAD_KEY_MSG
     if isinstance(exc, LLMConnectionError):

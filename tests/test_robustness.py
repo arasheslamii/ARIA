@@ -369,8 +369,9 @@ class _FakeSearch(Tool):
 
 
 async def test_slow_tool_turn_speaks_filler_but_strips_it_from_history():
+    from aria.core import lines
     from aria.core.memory import Memory
-    from aria.core.orchestrator import _FILLER, Orchestrator
+    from aria.core.orchestrator import Orchestrator
     from aria.llm.base import ToolCall
     from aria.tools.base import ToolRegistry
     from tests.conftest import FakeLLM
@@ -390,19 +391,23 @@ async def test_slow_tool_turn_speaks_filler_but_strips_it_from_history():
     )
 
     spoken = "".join([d async for d in orch.respond("what's the news")])
-    assert _FILLER.strip() in spoken  # SLOW tool -> filler spoken aloud
+    # SLOW tool -> a filler spoken aloud, picked from the varied pool.
+    filler = orch._turn_filler
+    assert filler in lines.FILLERS
+    assert filler.strip() in spoken
 
     saved = (await mem.recent_turns())[-1]
     assert saved[0] == "assistant"
-    assert _FILLER.strip() not in saved[1]  # but not persisted to history
+    assert filler.strip() not in saved[1]  # but not persisted to history
     await mem.close()
 
 
 async def test_fast_tool_turn_emits_no_filler():
-    # FIX 1c: a fast single-tool turn (calculate) must NOT emit the filler — that
+    # FIX 1c: a fast single-tool turn (calculate) must NOT emit any filler — that
     # was the source of the self-barge "Let me check" then silence.
+    from aria.core import lines
     from aria.core.memory import Memory
-    from aria.core.orchestrator import _FILLER, Orchestrator
+    from aria.core.orchestrator import Orchestrator
     from aria.llm.base import ToolCall
     from aria.tools.base import ToolRegistry
     from aria.tools.math_tool import MathTool
@@ -423,7 +428,7 @@ async def test_fast_tool_turn_emits_no_filler():
     )
 
     spoken = "".join([d async for d in orch.respond("what is two plus two")])
-    assert _FILLER.strip() not in spoken  # no filler on the fast path
+    assert not any(f.strip() in spoken for f in lines.FILLERS)  # fast path: no filler
     assert "four" in spoken  # still answers
     await mem.close()
 

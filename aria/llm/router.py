@@ -28,12 +28,15 @@ latest message into exactly one route and reply with ONLY compact JSON:
 Routes:
 - chitchat: greetings, thanks, simple general-knowledge Q&A, opinions, small talk.
 - tool: a single action/lookup (time, math, set timer, volume, open app, \
-screenshot, clipboard, lock screen, a single quick fact lookup).
+screenshot, clipboard, lock screen, a single quick fact lookup) — including a \
+single real-world errand: book/reserve a flight or hotel (with or without a \
+budget/criteria), buy a product, order food or coffee (each is ONE tool call; \
+the user pays in their own browser).
 - agentic: anything needing real research or multiple steps — NEWS, "what's \
 happening", "tell me about X", "catch me up", "go deeper"/"read that", deep \
-questions that need reading sources, plan a trip, triage email then reply, or \
-anything needing planning or several tools. When in doubt for news/research, pick \
-agentic so the answer is deep, not a snippet.
+questions that need reading sources, plan a trip (flight AND hotel, or research \
+first), triage email then reply, or anything needing planning or several tools. \
+When in doubt for news/research, pick agentic so the answer is deep, not a snippet.
 Prefer the cheapest route that fully satisfies the request, but DO route news and \
 research to agentic. Keep reason short."""
 

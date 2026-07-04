@@ -16,7 +16,13 @@ from typing import Any, Literal
 from aria.llm.base import ToolSpec
 
 # Risk class drives the safety layer (see aria.safety.permissions).
-Risk = Literal["safe", "confirm", "blocked"]
+#   safe     - runs immediately
+#   confirm  - needs an explicit yes (send email, create event, browse a site)
+#   commerce - spends money / builds a real-world order; like confirm but its own
+#              tier so it can never be silently auto-approved, and so the audit and
+#              read-back can treat it specially. The browser STOPS at payment.
+#   blocked  - refused outright
+Risk = Literal["safe", "confirm", "commerce", "blocked"]
 
 
 class ToolError(Exception):
@@ -38,10 +44,21 @@ class Tool(ABC):
     # JSON schema for parameters (OpenAI/Groq function-calling format).
     parameters: dict[str, Any] = {"type": "object", "properties": {}}
     risk: Risk = "safe"
+    # Sensitive tools handle private content (email/calendar bodies); their result
+    # content and argument VALUES are kept out of debug logs and the audit trail.
+    sensitive: bool = False
+    # Optional narration spoken when a SLOW tool round-trip begins (so the voice
+    # isn't silent during a multi-second browse). None -> the generic filler.
+    slow_filler: str | None = None
 
     @abstractmethod
     async def run(self, **kwargs: Any) -> ToolResult:
         """Execute the tool. Must be async and side-effect-aware."""
+
+    def confirm_summary(self, arguments: dict[str, Any]) -> str | None:
+        """A natural read-back for a confirm-gated action (e.g. the full email).
+        Return None to use the orchestrator's generic phrasing."""
+        return None
 
     def spec(self) -> ToolSpec:
         return ToolSpec(self.name, self.description, self.parameters)
