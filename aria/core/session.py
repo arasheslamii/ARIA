@@ -108,6 +108,17 @@ async def build_voice_session(
             if activation.mode == "hotkey":
                 activation = activation.model_copy(update={"mode": "wake_word"})
 
+    # If the cloud brain gets rate-limited mid-session, the LLM chain silently
+    # degrades to local Ollama — which is MUCH slower. Say so once, out loud,
+    # so multi-minute thinking reads as "degraded", never as "broken".
+    from aria.llm.local_fallback import LocalFallbackProvider
+
+    if isinstance(orch.llm, LocalFallbackProvider):
+        orch.llm.on_switch = lambda: announcements.put_nowait(
+            "Quick heads up — I've hit my cloud limit, so I'm thinking with my "
+            "slower local brain until it clears. Bear with me, replies will drag."
+        )
+
     pipeline = VoicePipeline(
         stt=stt,
         tts=tts,

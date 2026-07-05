@@ -58,12 +58,14 @@ class ToolExecutor:
         return result
 
     async def _run_with_resilience(self, tool: Tool, arguments: dict) -> ToolResult:
+        # A browser-agent tool legitimately runs for minutes; killing it at the
+        # quick-lookup default would abort the browse mid-flight (and the retry
+        # would then re-run a whole browser session — pure harm).
+        timeout = getattr(tool, "timeout_s", None) or self._config.timeout_s
         last_err: Exception | None = None
         for attempt in range(self._config.retries + 1):
             try:
-                return await asyncio.wait_for(
-                    tool.run(**arguments), timeout=self._config.timeout_s
-                )
+                return await asyncio.wait_for(tool.run(**arguments), timeout=timeout)
             except ToolError as exc:
                 # Expected failure — don't retry, surface it.
                 return ToolResult(content=f"error: {exc}", spoken=f"That didn't work: {exc}")

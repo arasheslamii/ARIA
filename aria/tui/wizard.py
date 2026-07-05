@@ -103,8 +103,10 @@ def _mic_ok() -> tuple[bool, str]:
 
 
 async def _download_wakeword(model: str) -> None:
-    """Fetch the openWakeWord model + shared feature models into its cache."""
-
+    """Fetch the openWakeWord model + shared feature models into its cache.
+    Custom model PATHS (a trained "hey topol" .onnx) are local files — skip."""
+    if model.endswith((".onnx", ".tflite")) or "/" in model:
+        return
     from openwakeword.utils import download_models
 
     await asyncio.to_thread(download_models, [model])

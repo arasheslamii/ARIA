@@ -264,7 +264,9 @@ async def test_warmup_recalls_previous_session(tmp_path):
     await orch.warm_up()
     assert "birthday" in orch._prev_session_note.lower()
     sys_msg = (await orch._base_messages())[0].content
-    assert "previous conversation" in sys_msg
+    # Injected as BACKGROUND only — never as an agenda to bring up unprompted.
+    assert "BACKGROUND ONLY" in sys_msg
+    assert "Never bring these up yourself" in sys_msg
     await mem.close()
 
 
@@ -467,9 +469,13 @@ async def test_stt_ghost_phrases_are_rejected_without_the_llm(tmp_path):
         assert await orch.accept_followup(utt) is False, utt
     # A real request that merely OPENS with thanks still fast-accepts…
     assert await orch.accept_followup("thanks, now set a timer for ten minutes") is True
-    # …and a pending confirmation reply is accepted before any ghost check.
+    # …and during a pending confirmation, real answers pass but outro ghosts
+    # still don't — noise must never answer (or re-ask) an old question.
     orch._pending = object()
-    assert await orch.accept_followup("Thank you.") is True
+    assert await orch.accept_followup("yes") is True
+    assert await orch.accept_followup("okay") is True  # a bare okay IS an answer
+    assert await orch.accept_followup("Thank you.") is False
+    assert await orch.accept_followup("Thanks for watching!") is False
     orch._pending = None
     await mem.close()
 
@@ -522,3 +528,75 @@ async def test_tts_error_propagates_through_lookahead():
 
     with pytest.raises(RuntimeError, match="voice model missing"):
         await pipeline._stream_to_tts(deltas())
+
+
+# --- 0.9.0: no more haunted confirmations (Siri-like sleep) ------------------
+def test_conversation_window_is_off_by_default_siri_style():
+    # Activate -> job done -> asleep. Continuous conversation is opt-in.
+    assert ConversationConfig().enabled is False
+
+
+async def test_stale_pending_confirmation_expires_instead_of_haunting(tmp_path):
+    import time as _time
+
+    from aria.core import orchestrator as orch_mod
+
+    llm = FakeLLM(
+        stream_text="Doing great, thanks for asking!",
+        chat_queue=[ChatResult(content='{"route":"chitchat","needs_tools":[],"reason":"x"}')],
+    )
+    orch, mem = await _bare_orch(llm, tmp_path)
+    orch._pending = orch_mod._Pending(
+        messages=[], calls=[], question="send the email — go ahead?",
+        created=_time.monotonic() - orch_mod._PENDING_TTL_S - 1,
+    )
+    out = "".join([d async for d in orch.respond("how are you doing today friend")])
+    assert orch._pending is None  # the two-hour-old question died quietly
+    assert "go ahead" not in out.lower()  # and was NOT re-asked
+    assert "Doing great" in out  # the actual request was answered normally
+    await mem.close()
+
+
+async def test_garbled_replies_stop_reasking_after_the_cap(tmp_path):
+    from aria.core import lines
+    from aria.core import orchestrator as orch_mod
+
+    # Every classify comes back unclear (garbled speech / noise).
+    llm = FakeLLM(chat_queue=[ChatResult(content="unclear")] * 5)
+    orch, mem = await _bare_orch(llm, tmp_path)
+    orch._pending = orch_mod._Pending(
+        messages=[], calls=[], question="order the pizza — go ahead?"
+    )
+    outs = []
+    for _ in range(orch_mod._MAX_REASKS + 1):
+        outs.append("".join([d async for d in orch.respond("mumble mumble garble noise wat")]))
+    # Re-asked at most the cap, then dropped it instead of looping forever.
+    assert orch._pending is None
+    assert outs[-1].strip() in lines.DROPPED
+    for earlier in outs[:-1]:
+        assert earlier.strip() in lines.CONFIRM_REASKS
+    await mem.close()
+
+
+async def test_confirm_window_noise_is_filtered_by_the_pipeline():
+    # A confirmation window capture now goes through the relevance filter too —
+    # the pipeline must consult it for ORIGIN_CONFIRM, not just conversation.
+    frames = [_speech() for _ in range(12)] + [_silence() for _ in range(25)]
+    heard: list[str] = []
+
+    async def reject(text: str) -> bool:
+        heard.append(text)
+        return False
+
+    pipeline = _conv_pipeline(frames, followup_filter=reject, stt_text="Thank you.")
+    pipeline._capture_origin = "confirm"  # simulate a confirm-window capture
+    from aria.voice import pipeline as pl
+
+    pipeline._capture_origin = pl._ORIGIN_CONFIRM
+    assert await pipeline._meant_for_us("Thank you.") is False
+    assert heard == ["Thank you."]
+    # Wake and push-to-talk captures stay unfiltered (explicitly user-initiated).
+    pipeline._capture_origin = pl._ORIGIN_WAKE
+    assert await pipeline._meant_for_us("Thank you.") is True
+    pipeline._capture_origin = pl._ORIGIN_PTT
+    assert await pipeline._meant_for_us("Thank you.") is True

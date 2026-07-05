@@ -54,7 +54,9 @@ async def test_fire_announces_and_notifies(tmp_path):
     await s.close()
 
     assert spoken and "Arash" in spoken[0] and "laundry timer" in spoken[0]
-    assert notified == [("Aria", "⏰ laundry timer")]
+    from aria import APP_NAME
+
+    assert notified == [(APP_NAME, "⏰ laundry timer")]
 
 
 async def test_fire_without_name_is_still_natural(tmp_path):

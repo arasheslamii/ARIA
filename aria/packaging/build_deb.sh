@@ -83,7 +83,7 @@ Depends: libportaudio2, libsecret-1-0, python3 (>= 3.11)
 Recommends: brightnessctl, playerctl, wl-clipboard, grim
 Installed-Size: ${INSTALLED_KB}
 Maintainer: Aria contributors <aria@localhost>
-Description: Aria - fast, agentic, voice-first AI assistant for Linux.
+Description: Topol - fast, agentic, voice-first AI assistant for Linux.
  A terminal-native voice assistant. Talk to it; it talks back. No GUI.
  Bundles a self-contained Python runtime, a local Piper voice, and an
  on-device wake word. Run 'aria setup', then 'aria', then 'aria enable'.

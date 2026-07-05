@@ -203,3 +203,127 @@ def test_activation_defaults():
     assert a.mode == "wake_word"  # opt-in: nothing changes until the user picks
     assert a.hotkey in KEY_CHOICES
     assert a.chime is True
+
+
+# --- recovery: a mid-turn crash must never leave her deaf (the "dead until
+# reboot" bug: the daemon re-enters run() but the state machine was stuck in
+# THINKING, which the loop only ever leaves — so every frame was ignored).
+class ExplodingOnceSTT(FakeSTT):
+    def __init__(self) -> None:
+        super().__init__("hello")
+        self.calls = 0
+
+    async def transcribe(self, audio, *, language=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("network died mid-transcription")
+        return "hello again"
+
+
+async def test_crashed_turn_recovers_on_rerun_like_the_daemon_does():
+    key = FakeKey()
+    stt = ExplodingOnceSTT()
+    transcripts: list[str] = []
+
+    async def respond(t):
+        transcripts.append(t)
+        yield "Hi!"
+
+    def pipeline_with(frames):
+        mic = KeyedMic(frames, key, press_at=0, release_at=20)
+        p = _ptt_pipeline(mic, key)
+        p.stt = stt
+        return p
+
+    frames = [_speech() for _ in range(40)]
+    pipeline = pipeline_with(frames)
+    with pytest.raises(RuntimeError, match="network died"):
+        await pipeline.run(respond)
+    # The crash left the machine mid-turn — the daemon now re-runs the SAME
+    # pipeline object (run_with_mic_retry), like after any transient failure.
+    key.pressed = False
+    pipeline.mic = KeyedMic([_speech() for _ in range(40)], key, 0, 20)
+    await pipeline.run(respond)
+    assert transcripts == ["hello again"]  # she woke up again, no reboot needed
+
+
+async def test_crash_while_speaking_also_recovers(monkeypatch):
+    # Same idea, but the death happens in the reply stream (TTS/LLM path),
+    # leaving state SPEAKING with a leftover _ptt_hold.
+    key = FakeKey()
+    calls = {"n": 0}
+
+    async def respond(t):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("provider exploded mid-reply")
+        yield "Recovered."
+
+    frames = [_speech() for _ in range(40)]
+    pipeline = _ptt_pipeline(KeyedMic(frames, key, 0, 20), key)
+    with pytest.raises(RuntimeError, match="exploded"):
+        await pipeline.run(respond)
+    key.pressed = False
+    pipeline.mic = KeyedMic([_speech() for _ in range(40)], key, 0, 20)
+    await pipeline.run(respond)
+    assert calls["n"] == 2  # the second turn was heard and answered
+
+
+# --- 0.9.2: the chime must never be part of the capture ----------------------
+class LengthSpySTT(FakeSTT):
+    def __init__(self, text="what's the weather") -> None:
+        super().__init__(text)
+        self.sample_counts: list[int] = []
+
+    async def transcribe(self, audio, *, language=None):
+        self.sample_counts.append(audio.pcm.size)
+        return self.text
+
+
+async def test_chime_span_is_discarded_from_the_capture():
+    """The live bug: the chime bled from the speakers into the mic, Whisper
+    transcribed it as 'BEEP', and she told the user they had trouble speaking."""
+    key = FakeKey()
+    frames = [_speech() for _ in range(40)]
+    mic = KeyedMic(frames, key, press_at=0, release_at=30)
+    stt = LengthSpySTT()
+    pipeline = _ptt_pipeline(mic, key, chime=True)
+    pipeline.stt = stt
+    transcripts: list[str] = []
+
+    async def respond(t):
+        transcripts.append(t)
+        yield "Sunny."
+
+    await pipeline.run(respond)
+    assert transcripts == ["what's the weather"]
+    # The chime span (~0.35s = ~11 frames of 480 samples) was NOT recorded.
+    skipped = int((len(make_chime(FakeTTS.sample_rate)) / FakeTTS.sample_rate + 0.15)
+                  * 1000 / 30)
+    assert skipped >= 8
+    # 30 pressed frames minus the chime span (trigger + release frames included).
+    assert stt.sample_counts[0] <= (30 - skipped + 1) * 480
+
+
+async def test_junk_transcripts_never_reach_the_brain():
+    from aria.voice.pipeline import _is_junk
+
+    for junk in ("BEEP", ".", "Oh", "Uh...", "hmm", "you", "Mm-hm..."[:3]):
+        assert _is_junk(junk), junk
+    for real in ("yes", "no", "yeah", "okay", "stop", "what time is it"):
+        assert not _is_junk(real), real
+
+    # End-to-end: a capture that transcribes to junk is dropped silently.
+    key = FakeKey()
+    frames = [_speech() for _ in range(30)]
+    mic = KeyedMic(frames, key, press_at=0, release_at=20)
+    pipeline = _ptt_pipeline(mic, key)
+    pipeline.stt = FakeSTT("BEEP")
+    heard: list[str] = []
+
+    async def respond(t):
+        heard.append(t)
+        yield "?"
+
+    await pipeline.run(respond)
+    assert heard == []  # she stays quiet instead of "you seem to have trouble"

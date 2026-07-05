@@ -72,6 +72,7 @@ class BrowseWebTool(Tool):
     }
     risk = "confirm"  # opening a real browser session is an explicit, gated action
     slow_filler = "Sure — opening the browser and taking a look. One moment."
+    timeout_s = 330.0  # a real browse runs minutes; run_web_task caps it at 240s
 
     def __init__(self, engine_provider: EngineProvider) -> None:
         self._engine = engine_provider
@@ -122,6 +123,10 @@ class OrderFoodTool(Tool):
     def __init__(self, config_provider: ConfigProvider, engine_provider: EngineProvider) -> None:
         self._config = config_provider
         self._engine = engine_provider
+
+    @property
+    def timeout_s(self) -> float:  # the browse itself is capped by max_seconds
+        return self._config().max_seconds + 90.0
 
     def confirm_summary(self, arguments: dict[str, Any]) -> str:
         request = str(arguments.get("request") or "food")
@@ -218,14 +223,18 @@ def build_hotel_task(
     if preferences:
         lines.append(f"The user wants: {preferences}.")
     lines.append(
-        "Use the site's own filters and sorting (price, review score). Pick the "
-        "BEST option: the highest-rated property that fits the budget in a sensible "
-        "location; prefer free cancellation and a rating of 8+ when available. Open "
-        "it, choose the cheapest room type that fits the whole stay, and click "
-        "through the reservation flow (Reserve / See availability). STOP at the "
-        "guest-details/payment step — enter NO personal or card details and confirm "
-        "nothing. Report: hotel name, review score, room type, TOTAL price for the "
-        "stay, and whether cancellation is free."
+        "FIRST dismiss any cookie/consent dialog and any sign-in or app popup — "
+        "they block everything else. Then sort the results by review score or "
+        "rating ('Top reviewed'); if sorting is fiddly, just scan the visible "
+        "result cards. Pick the BEST option: the highest-rated property whose "
+        "per-night price fits the budget, in a sensible location; prefer free "
+        "cancellation and a rating of 8+ when available. Don't overthink — a "
+        "good pick fast beats a perfect pick never. Open it, choose the cheapest "
+        "room type that fits the whole stay, and click through the reservation "
+        "flow (See availability / Reserve / I'll reserve). STOP at the "
+        "guest-details/payment step — enter NO personal or card details and "
+        "confirm nothing. Report: hotel name, review score, room type, TOTAL "
+        "price for the stay, and whether cancellation is free."
     )
     return " ".join(lines)
 
@@ -250,12 +259,14 @@ def build_flight_task(
     if preferences:
         lines.append(f"The user wants: {preferences}.")
     lines.append(
-        "Pick the BEST option: balance price, total duration, and stops (the top "
-        "'Best' ranked result usually wins; prefer nonstop when the price is close). "
-        "Select it and continue to the booking handoff (the airline's or agent's "
-        "booking page). STOP there — enter NO passenger or payment details and "
-        "confirm nothing. Report: airline, departure and arrival times, duration, "
-        "stops, and the price."
+        "FIRST dismiss any cookie/consent dialog or sign-in popup — they block "
+        "everything else. Pick the BEST option: balance price, total duration, and "
+        "stops (the top 'Best' ranked result usually wins; prefer nonstop when the "
+        "price is close). Don't overthink — a good pick fast beats a perfect pick "
+        "never. Select it and continue to the booking handoff (the airline's or "
+        "agent's booking page). STOP there — enter NO passenger or payment details "
+        "and confirm nothing. Report: airline, departure and arrival times, "
+        "duration, stops, and the price."
     )
     return " ".join(lines)
 
@@ -296,6 +307,10 @@ class ReserveHotelTool(Tool):
     def __init__(self, config_provider: ConfigProvider, engine_provider: EngineProvider) -> None:
         self._config = config_provider
         self._engine = engine_provider
+
+    @property
+    def timeout_s(self) -> float:
+        return self._config().max_seconds + 90.0
 
     def confirm_summary(self, arguments: dict[str, Any]) -> str:
         where = arguments.get("destination", "there")
@@ -353,6 +368,10 @@ class ReserveFlightTool(Tool):
     def __init__(self, config_provider: ConfigProvider, engine_provider: EngineProvider) -> None:
         self._config = config_provider
         self._engine = engine_provider
+
+    @property
+    def timeout_s(self) -> float:
+        return self._config().max_seconds + 90.0
 
     def confirm_summary(self, arguments: dict[str, Any]) -> str:
         route = f"{arguments.get('origin', '?')} to {arguments.get('destination', '?')}"

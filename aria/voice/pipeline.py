@@ -13,6 +13,7 @@ coroutine that yields text deltas, keeping the LLM/agent logic decoupled.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
@@ -82,6 +83,19 @@ _ORIGIN_PTT = "ptt"  # push-to-talk: capture runs exactly while the key is held
 _MIN_VOICED_FRAMES = 3  # ~90ms of speech (wake / confirmation captures)
 _MIN_VOICED_FRAMES_CONVO = 8  # ~240ms of speech (open-mic conversation window)
 
+# What Whisper writes for a capture that was really just a breath, a click, or
+# the tail of the activation chime. Sending these to the brain produces "you
+# seem to be having trouble speaking" chatter — treat them as silence instead.
+# Deliberately EXCLUDES real one-word answers (yes/no/yeah/okay/stop).
+_JUNK_TRANSCRIPTS = frozenset({
+    "", "oh", "uh", "um", "hmm", "huh", "mm", "mhm", "ah", "eh",
+    "beep", "boop", "you", "bye", "the", "a", "and", "so",
+})
+
+
+def _is_junk(transcript: str) -> bool:
+    return re.sub(r"[^a-z]+", " ", transcript.lower()).strip() in _JUNK_TRANSCRIPTS
+
 
 def _rms(frame: np.ndarray) -> float:
     if frame.size == 0:
@@ -148,6 +162,9 @@ class VoicePipeline:
         # PTT capture runs, the key RELEASE (not silence) ends it.
         self._hotkey = hotkey
         self._ptt_hold = False
+        # Mic frames still to discard because they were recorded while the
+        # activation chime played (they contain the chime, not the user).
+        self._skip_frames = 0
         # Wake-word spotting is off in pure hotkey mode (activation_cfg says so).
         self._wake_active = activation_cfg is None or activation_cfg.mode != "hotkey"
         # The "I'm listening" earcon, pre-rendered at the speaker's rate. None
@@ -209,6 +226,7 @@ class VoicePipeline:
         # without a reset every frame would be ignored forever: alive but deaf
         # until a reboot. Always start a run from a clean IDLE.
         self._ptt_hold = False
+        self._skip_frames = 0
         self._followup_deadline = 0.0
         self._reset_idle()
 
@@ -251,6 +269,14 @@ class VoicePipeline:
                         barge = 0
 
                 elif self.state is State.LISTENING:
+                    if self._skip_frames > 0:
+                        # These frames arrived while the activation chime was
+                        # playing — they're the chime bleeding from the speakers
+                        # into the mic. Recording them made Whisper transcribe
+                        # the chime itself ("BEEP") whenever the user paused
+                        # before speaking. Drop them; the capture starts clean.
+                        self._skip_frames -= 1
+                        continue
                     if ptt_now and not self._ptt_hold:
                         # Key pressed inside an open follow-up window: adopt PTT
                         # semantics — hold the mic for as long as the key is down.
@@ -327,7 +353,12 @@ class VoicePipeline:
         return bool(self._hotkey is not None and getattr(self._hotkey, "pressed", False))
 
     async def _ack(self) -> None:
-        """Play the short 'I'm listening' chime (never fatal — it's cosmetic)."""
+        """Play the short 'I'm listening' chime (never fatal — it's cosmetic).
+
+        The mic keeps queueing frames while the chime plays through the
+        speakers, so the chime bleeds into the capture. Mark that span to be
+        DISCARDED by the run loop — otherwise a pause after activation gives
+        Whisper nothing but the chime, transcribed as "BEEP"."""
         if self._chime_pcm is None:
             return
         try:
@@ -335,6 +366,8 @@ class VoicePipeline:
             await self.speaker.play(_one_frame(self._chime_pcm))
         except Exception:  # noqa: BLE001 - a broken speaker mustn't kill the loop
             pass
+        chime_s = len(self._chime_pcm) / self.tts.sample_rate
+        self._skip_frames = int((chime_s + 0.15) * 1000 / self.audio_cfg.block_ms)
 
     def _wake_triggered(self, frame: np.ndarray, sr: int) -> bool:
         if not self.wake_cfg.enabled:
@@ -392,8 +425,8 @@ class VoicePipeline:
         if pcm.size < sr // 4:  # < 0.25s -> noise, ignore
             return None
         transcript = (await self.stt.transcribe(AudioChunk(pcm, sr))).strip()
-        if not transcript:
-            return None
+        if not transcript or _is_junk(transcript):
+            return None  # noise, a breath, or chime echo — not words for anybody
         if not await self._meant_for_us(transcript):
             return None  # background speech in the open-mic window — ignore it
         self._on_transcript(transcript)
@@ -401,9 +434,14 @@ class VoicePipeline:
         return asyncio.create_task(self._speak(respond, transcript))
 
     async def _meant_for_us(self, transcript: str) -> bool:
-        """Gate conversation-window captures through the relevance filter. Wake-word
-        and confirmation-reply captures are always accepted (they're explicit)."""
-        if self._capture_origin != _ORIGIN_CONVERSATION or self._followup_filter is None:
+        """Gate open-window captures through the relevance filter. Wake-word and
+        push-to-talk captures are always accepted (the user explicitly invoked
+        those); conversation AND confirmation windows opened by themselves, so
+        their captures may be nothing but room noise."""
+        if (
+            self._capture_origin not in (_ORIGIN_CONVERSATION, _ORIGIN_CONFIRM)
+            or self._followup_filter is None
+        ):
             return True
         try:
             return await self._followup_filter(transcript)

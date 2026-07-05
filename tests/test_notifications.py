@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from aria import APP_NAME
 from aria.core.memory import Memory
-from aria.core.orchestrator import _NO_RESPONSE_FALLBACK, Orchestrator
+from aria.core.orchestrator import Orchestrator
 from aria.llm.base import ChatResult
 from aria.tools.base import ToolRegistry
 
@@ -24,11 +25,11 @@ async def test_desktop_notify_is_branded(monkeypatch):
 
     from aria.core.scheduler import desktop_notify
 
-    await desktop_notify("Aria", "your laundry timer is up")
+    await desktop_notify(APP_NAME, "your laundry timer is up")
 
-    assert recorded["init"]["app_name"] == "Aria"  # not "python"
+    assert recorded["init"]["app_name"] == APP_NAME  # not "python"
     assert recorded["init"].get("app_icon")  # an Aria icon is supplied
-    assert recorded["send"]["title"] == "Aria"
+    assert recorded["send"]["title"] == APP_NAME
     assert recorded["send"]["message"] == "your laundry timer is up"
     # FIX B: sound must NOT be passed as a bool (newer desktop_notifier crashes).
     assert not isinstance(recorded["send"].get("sound"), bool)
@@ -52,7 +53,7 @@ async def test_desktop_notify_never_raises_on_backend_error(monkeypatch):
     from aria.core.scheduler import desktop_notify
 
     # Must return cleanly (no exception).
-    assert await desktop_notify("Aria", "ping") is None
+    assert await desktop_notify("Topol", "ping") is None
 
 
 async def test_turn_never_ends_silent():

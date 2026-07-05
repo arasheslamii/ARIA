@@ -20,16 +20,28 @@ class NullWakeWord(WakeWord):
 
 class OpenWakeWord(WakeWord):
     def __init__(self, model: str = "hey_jarvis", threshold: float = 0.5) -> None:
+        from pathlib import Path
+
         from openwakeword.model import Model  # optional dependency
         from openwakeword.utils import download_models
 
         self.threshold = threshold
-        self.model_name = model
-        # Ensure the model + feature models are present (no-op once cached).
-        try:
-            download_models([model])
-        except Exception:  # offline + already cached is fine; load will tell us
-            pass
+        # ``model`` is either a stock openWakeWord name ("hey_jarvis") or a PATH
+        # to a custom-trained .onnx/.tflite (e.g. a "hey topol" model). Paths
+        # load as-is; their scores are keyed by the file's stem.
+        is_path = model.endswith((".onnx", ".tflite")) or "/" in model
+        self.model_name = Path(model).stem if is_path else model
+        if is_path and not Path(model).expanduser().exists():
+            raise FileNotFoundError(
+                f"Custom wake-word model not found: {model} — check "
+                "[wakeword] model in the config."
+            )
+        if not is_path:
+            # Ensure the stock model + feature models are cached (no-op after).
+            try:
+                download_models([model])
+            except Exception:  # offline + already cached is fine; load will tell
+                pass
         # Force the ONNX backend: the bundled tflite_runtime is built against
         # numpy<2 and crashes under numpy 2.x, while onnxruntime supports it.
         self._model = Model(wakeword_models=[model], inference_framework="onnx")

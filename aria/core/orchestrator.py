@@ -20,7 +20,10 @@ re-entrancy.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -99,7 +102,7 @@ _SALIENT_ARGS = ("to", "recipient", "query", "path", "name", "title", "expressio
 # audio decodes to outro boilerplate). An open-mic capture whose ENTIRE content
 # is one of these is a ghost, not a turn: answering it makes Aria talk to an
 # empty room, which re-opens the window and snowballs into her "asking things"
-# by herself. Wake-word and confirmation captures are never checked — the user
+# by herself. Wake-word and push-to-talk captures are never checked — the user
 # explicitly invoked those. Matched on the lowercased, punctuation-free text.
 _STT_GHOSTS = frozenset({
     "thank you", "thanks", "thank you for watching", "thanks for watching",
@@ -109,6 +112,11 @@ _STT_GHOSTS = frozenset({
     "bye", "bye bye", "goodbye", "the end",
     "you", "so", "yeah", "okay", "uh", "um", "hmm", "oh",
 })
+# While a confirmation is pending, a bare "yeah"/"okay" is a REAL answer — but
+# the outro-boilerplate ghosts still aren't. Without this, noise in the reply
+# window becomes an "unclear" verdict and she re-asks the old question into an
+# empty room, over and over (the "haunted by her own memory" bug).
+_STT_GHOSTS_CONFIRM = _STT_GHOSTS - {"yeah", "okay"}
 
 
 def _normalize_utterance(text: str) -> str:
@@ -164,6 +172,37 @@ class _Pending:
     calls: list[ToolCall]
     question: str = ""
     specs: list = field(default_factory=list)
+    created: float = field(default_factory=time.monotonic)
+    reasks: int = 0
+
+
+# An unanswered confirmation dies quietly after this long. Without an expiry it
+# lurks FOREVER: hours later any captured noise re-awakens the old question
+# ("do you want me to … — yes or no?"), which reads as haunted, not helpful.
+_PENDING_TTL_S = 120.0
+# And a live one gets at most this many "yes or no?" re-asks before it's dropped
+# — garbled replies must never produce an endless re-ask loop.
+_MAX_REASKS = 2
+
+
+def _call_signature(call: ToolCall) -> tuple[str, str]:
+    return call.name, json.dumps(call.arguments or {}, sort_keys=True)
+
+
+def _failed_call_signatures(messages: list[Message]) -> set[tuple[str, str]]:
+    """Signatures of the tool calls in this turn whose results were errors —
+    used to refuse identical retries (which would re-trigger confirmation)."""
+    by_id: dict[str, ToolCall] = {}
+    for m in messages:
+        for c in m.tool_calls:
+            by_id[c.id] = c
+    return {
+        _call_signature(by_id[m.tool_call_id])
+        for m in messages
+        if m.role == "tool"
+        and m.tool_call_id in by_id
+        and (m.content or "").lstrip().lower().startswith("error")
+    }
 
 
 def _verdict_word(text: str | None, options: tuple[str, ...]) -> str | None:
@@ -171,6 +210,51 @@ def _verdict_word(text: str | None, options: tuple[str, ...]) -> str | None:
     Tolerates punctuation and role-echo prefixes some local templates leak."""
     m = re.search(r"\b(" + "|".join(options) + r")\b", (text or "").lower())
     return m.group(1) if m else None
+
+
+# A reply that OPENS with a clear yes and contains no amendment/negation cue is
+# a plain go-ahead, however long ("yes, find whatever you can", "sure go for it").
+# Anything that might be changing the plan still goes to the classifier.
+_LEADING_YES = re.compile(
+    r"^(yes|yeah|yep|yup|sure|ok(ay)?|absolutely|go ahead|go for it|do it|please do)\b",
+    re.IGNORECASE,
+)
+_AMENDMENT_CUES = re.compile(
+    r"\b(but|instead|actually|change|rather|except|no|not|don'?t|make it|wait|"
+    r"add|remove|cancel|different|another)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_plain_go_ahead(text: str) -> bool:
+    t = text.strip()
+    return bool(_LEADING_YES.match(t)) and not _AMENDMENT_CUES.search(t)
+
+
+# The highest-frequency trivial asks get answered with ZERO model calls — they
+# must be instant even when the cloud is rate-limited and the local brain is
+# slow. ("What time is it" once took minutes on the fallback path: router call
+# + tool call + synthesis, each at local-CPU speed, for a datetime lookup.)
+_INSTANT_TIME = frozenset({
+    "what time is it", "what's the time", "what is the time", "the time",
+    "time please", "what time is it now", "what's the time now",
+    "tell me the time", "current time", "what time is it right now",
+})
+_INSTANT_DATE = frozenset({
+    "what's the date", "what is the date", "what day is it", "what's today",
+    "what's today's date", "what is today's date", "what day is it today",
+    "tell me the date", "today's date", "what's the date today",
+})
+
+
+def _instant_answer(transcript: str) -> str | None:
+    t = " ".join(re.sub(r"[^a-z' ]+", " ", transcript.lower()).split())
+    now = datetime.now().astimezone()
+    if t in _INSTANT_TIME:
+        return f"It's {now.strftime('%-I:%M %p').lower().lstrip('0')}."
+    if t in _INSTANT_DATE:
+        return f"It's {now.strftime('%A, %-d %B')}."
+    return None
 
 
 def interpret_yes_no(text: str) -> bool | None:
@@ -260,31 +344,50 @@ class Orchestrator:
         await self._recall_last_session()
 
     async def _recall_last_session(self) -> None:
-        """Summarize the tail of the previous session (best-effort, one fast call)
-        so 'what were we talking about yesterday?' actually works."""
+        """Summarize the tail of an earlier session from TODAY (best-effort, one
+        fast call) so "what were we talking about?" works after a restart.
+        Transcripts are purged daily, so mornings start with no note at all —
+        and the note is a neutral topic list, never an agenda: the old wording
+        ("anything left open — tasks, questions") made her greet the user with
+        homework ("shall I check that hotel availability?")."""
         try:
             turns = await self.memory.recent_turns(12)
             if not turns:
                 return
             convo = "\n".join(f"{role}: {content}" for role, content in turns)
             prompt = (
-                "Here is the end of a voice assistant's previous conversation with "
-                f"its user:\n{convo}\n\n"
-                "In under 40 words, note what it was about and anything left open "
-                "(tasks, questions, plans). Reply with the note only."
+                "Here is the end of a voice assistant's earlier conversation "
+                f"today with its user:\n{convo}\n\n"
+                "In under 25 words, list the topics discussed. A plain, neutral "
+                "summary only — no open tasks, no follow-up suggestions, no "
+                "questions. Reply with the note only."
             )
             result = await self.llm.chat(
-                [user(prompt)], model=self.fast_model, temperature=0.2, max_tokens=90
+                [user(prompt)], model=self.fast_model, temperature=0.2, max_tokens=60
             )
-            self._prev_session_note = (result.content or "").strip()[:400]
+            self._prev_session_note = (result.content or "").strip()[:300]
         except Exception:  # noqa: BLE001 - recall is a nicety, never a blocker
             self._prev_session_note = ""
 
     async def respond(self, transcript: str) -> AsyncIterator[str]:
         """Main entry from the voice pipeline. Yields spoken-text deltas."""
+        if (
+            self._pending is not None
+            and time.monotonic() - self._pending.created > _PENDING_TTL_S
+        ):
+            # The user walked away from an old confirmation — let it die instead
+            # of interpreting whatever they say NOW as an answer to it.
+            dlog("pending confirmation expired — dropped")
+            self._pending = None
         await self.memory.log_turn("user", transcript)
         self._history.append(user(transcript))
         self._trim_history()
+
+        if self._pending is None and (instant := _instant_answer(transcript)):
+            self._history.append(assistant(instant))
+            await self.memory.log_turn("assistant", instant)
+            yield instant
+            return
 
         spoken_parts: list[str] = []
         self._turn_filler = _FILLER
@@ -385,6 +488,7 @@ class Orchestrator:
         turn resumes from the stashed state via :meth:`_resume_pending`.
         """
         filler_spoken = False
+        failed = _failed_call_signatures(messages)
         for _ in range(_MAX_TOOL_STEPS):
             result = await self.llm.chat(
                 messages, model=self.reasoning_model, tools=specs, temperature=0.3
@@ -395,6 +499,20 @@ class Orchestrator:
                 return
 
             messages.append(assistant(result.content, result.tool_calls))
+            if all(_call_signature(c) in failed for c in result.tool_calls):
+                # The model is re-issuing the EXACT call(s) that already failed
+                # this turn. Without this brake, a gated tool that errors gets
+                # re-planned, re-CONFIRMED, and re-run forever — the user hears
+                # the same question in a loop. Refuse the retry and force an
+                # honest report instead.
+                for call in result.tool_calls:
+                    messages.append(tool_result(
+                        call.id,
+                        "error: this exact call already failed this turn. Do NOT "
+                        "call it again — tell the user plainly what failed and stop.",
+                        name=call.name,
+                    ))
+                continue
             gated = [c for c in result.tool_calls if self._needs_confirmation(c)]
             slow_calls = [c for c in result.tool_calls if _is_slow_call(c.name)]
             if slow_calls and not gated and not filler_spoken:
@@ -414,6 +532,7 @@ class Orchestrator:
                 return
 
             await self._execute_calls(messages, result.tool_calls)
+            failed = _failed_call_signatures(messages)
 
         # Exhausted steps: stream a wrap-up (synthesis model), still grounded.
         async for delta in self.llm.stream(
@@ -437,9 +556,20 @@ class Orchestrator:
         if len(transcript.split()) <= _MAX_REGEX_REPLY_WORDS:
             answer = interpret_yes_no(transcript)
             verdict = {True: "yes", False: "no", None: None}[answer]
+        if verdict is None and _is_plain_go_ahead(transcript):
+            # "yes, find whatever you can" — an emphatic yes with no amendment.
+            # Resolved instantly: an LLM round-trip here means seconds (or, on
+            # the local fallback, MINUTES) of dead silence after the user's yes.
+            verdict = "yes"
         if verdict is None:
             verdict = await self._classify_confirmation(transcript, pending.question)
         if verdict == "unclear":
+            pending.reasks += 1
+            if pending.reasks > _MAX_REASKS:
+                # Enough — drop it instead of asking into the void forever.
+                self._pending = None
+                yield lines.pick(lines.DROPPED)
+                return
             yield lines.pick(lines.CONFIRM_REASKS)
             return  # keep pending for another try
 
@@ -505,7 +635,9 @@ class Orchestrator:
         re-opens the mic after every answer, so the TV or a side conversation can
         land here. Three tiers, each biased towards NOT eating a real user turn:
 
-        1. a pending confirmation reply is always accepted;
+        1. a pending confirmation reply is accepted UNLESS it's a known Whisper
+           silence-hallucination — noise must not "answer" (or re-ask) an old
+           confirmation question;
         2. a known Whisper silence-hallucination ("Thank you.") is rejected
            outright — it is what the STT says when NOBODY spoke;
         3. an utterance that OPENS like a command/continuation ("and…", "what…",
@@ -514,6 +646,9 @@ class Orchestrator:
         4. everything else is judged by the fast model with a lenient, few-shot
            prompt (validated against local 3B models), failing OPEN."""
         if self._pending is not None:
+            if _normalize_utterance(transcript) in _STT_GHOSTS_CONFIRM:
+                dlog(f"confirm-window capture dropped as an STT ghost: {transcript!r}")
+                return False
             return True
         if _normalize_utterance(transcript) in _STT_GHOSTS:
             dlog(f"followup dropped as an STT ghost: {transcript!r}")
@@ -574,6 +709,10 @@ class Orchestrator:
         self._capture_sources(res)
         shown = "[redacted]" if getattr(tool, "sensitive", False) else _truncate(res.content)
         dlog(f"tool {name} result: {shown}")
+        if res.content.lstrip().lower().startswith("error"):
+            # Failures must be visible in the daemon journal (dlog is debug-only)
+            # or live problems like a dead browser engine are undiagnosable.
+            logging.getLogger("aria.tools").warning("tool %s failed: %s", name, shown)
         return res.content
 
     def _capture_sources(self, res) -> None:
@@ -660,8 +799,10 @@ class Orchestrator:
             sys += f"\n\nEarlier in this conversation (summary): {self._summary}"
         if self._prev_session_note:
             sys += (
-                f"\n\nFrom your previous conversation with them: "
-                f"{self._prev_session_note}"
+                "\n\nBACKGROUND ONLY — topics from an earlier chat today: "
+                f"{self._prev_session_note}. Never bring these up yourself; use "
+                "them only if the user refers back to them. A greeting gets a "
+                "greeting, not old business."
             )
         return [system(sys), *self._history]
 

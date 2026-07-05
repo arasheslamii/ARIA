@@ -1,11 +1,12 @@
-# Aria
+# Topol
 
 **A fast, agentic, voice-first AI assistant for Linux.** Talk to it; it talks
 back — instantly and naturally. Terminal-native (no GUI), trivial to install,
 and genuinely capable of doing things on your machine.
 
-> "Siri, but actually good." The name *Aria* is a placeholder — it lives in one
-> constant (`aria.APP_NAME`) and can be renamed everywhere at once.
+> "Siri, but actually good." The product name is **Topol** (`aria.APP_NAME`);
+> the binary, package, and config paths keep the original `aria` slug so
+> existing installs and data stay intact.
 
 ---
 
@@ -14,7 +15,7 @@ and genuinely capable of doing things on your machine.
 Download `aria_<version>_amd64.deb` and:
 
 ```bash
-sudo apt install ./aria_0.8.0_amd64.deb   # pulls libportaudio2 + libsecret-1-0
+sudo apt install ./aria_0.9.2_amd64.deb   # pulls libportaudio2 + libsecret-1-0
 aria setup                                # paste your Groq API key (stored securely)
 aria                                       # say the wake word and talk
 aria enable                                # run her in the background on every login
@@ -46,7 +47,7 @@ you'll also want some system packages for audio and desktop control:
 sudo apt install -y libportaudio2 libsecret-1-0 \
     brightnessctl playerctl wl-clipboard grim   # optional, for system control
 
-# create the env and install Aria (editable)
+# create the env and install Topol (editable)
 uv venv --python 3.11
 uv pip install -e ".[dev]"
 ```
@@ -75,7 +76,7 @@ stack from the keyboard.
 ### Run it fully local (Ollama) — no key, private, offline
 
 If [Ollama](https://ollama.com) is running, the wizard offers **Local (Ollama)**
-alongside Groq. Pick it and Aria runs entirely on your machine — no API key, no
+alongside Groq. Pick it and Topol runs entirely on your machine — no API key, no
 cloud. The model choice is **adaptive to whatever you've pulled**: it inspects
 `ollama list`, ranks by real parameter count with a tool-calling boost, and picks
 the strongest *tool-capable* model for reasoning (a 32B/70B beats an 8B
@@ -87,7 +88,7 @@ Speech-to-text also goes local (faster-whisper, bundled in the `.deb`), so the
 
 ### Automatic local fallback — the daily limit never stops her
 
-If you use **Groq as the main brain** and a local Ollama exists, Aria switches to
+If you use **Groq as the main brain** and a local Ollama exists, Topol switches to
 it **automatically and mid-conversation** whenever Groq is rate-limited (the free
 tier's daily token cap) or the network is down — slightly less brilliant for a
 while, but she keeps working instead of apologizing. Zero configuration: it's on
@@ -116,9 +117,35 @@ Three ways to start talking, picked in `aria setup` → **Activation**:
   her off and listens — guaranteed barge-in.
 
 Either way, a short rising **chime** confirms she's actually listening the moment
-she activates (disable with `[activation] chime = false`). After she answers or
-asks you something, the mic stays open for a **4-second** follow-up window, then
-she needs re-activating.
+she activates (disable with `[activation] chime = false`). Siri-style by default:
+she answers and goes back to sleep. Only when SHE asks you something (a
+confirmation, a question) does the mic re-open — for **4 seconds**. If you want
+the always-flowing mode back (mic re-opens after every answer), set
+`[conversation] enabled = true`.
+
+### Custom wake word — "hey topol"
+
+The stock wake models are openWakeWord's pretrained set (`hey_jarvis` is the
+default); "hey topol" needs a **one-time custom training run** (~30-60 min on a
+free Google Colab GPU — it synthesizes thousands of spoken samples and trains a
+small classifier; a laptop CPU is not the right tool for it):
+
+1. Open openWakeWord's **automatic model training notebook** in Colab:
+   <https://github.com/dscripka/openWakeWord> → `notebooks/automatic_model_training.ipynb`
+   (there's an "Open in Colab" badge in their docs).
+2. Set the target phrase to `hey topol`, run all cells, and download the
+   resulting `hey_topol.onnx`.
+3. Drop it in `~/.local/share/aria/models/` and point the config at it:
+
+   ```toml
+   [wakeword]
+   model = "/home/YOU/.local/share/aria/models/hey_topol.onnx"
+   ```
+4. `systemctl --user restart aria` — she now wakes to "hey topol". If the file
+   is missing she says so at startup and falls back cleanly.
+
+Custom `.onnx`/`.tflite` paths are fully supported by the config; until you
+train one, `hey_jarvis` (or hold-to-talk) keeps working.
 
 ### Reconfigure later (without re-entering your key)
 
@@ -131,7 +158,7 @@ never asks for your Groq key again.
 
 ## Always-on background mode
 
-Run Aria as a background service so she's just *there* — listening for the wake
+Run Topol as a background service so she's just *there* — listening for the wake
 word and firing your alarms — with no terminal open. She runs as a **systemd
 user service**, so she shares your login's PipeWire audio.
 
@@ -156,7 +183,7 @@ crash-looping, so she's never dead for the first minute after a restart.
 
 ### Privacy reality
 
-In background mode Aria is **always listening locally** for her wake word
+In background mode Topol is **always listening locally** for her wake word
 (openWakeWord, on-device — nothing leaves your machine until the wake word
 fires). Only after the wake word does audio go to Groq for transcription. There
 is no telemetry. To pause her completely: `aria stop` (this session) or
@@ -193,7 +220,7 @@ the mic re-opens right after she speaks, so you just say *"yes"* with no wake wo
 
 ## Order food — "buy me a pizza" (agentic, stops at payment)
 
-Aria can drive a **real browser** to find a good shop, build your cart, fill in the
+Topol can drive a **real browser** to find a good shop, build your cart, fill in the
 delivery address, and go to the checkout — then **STOP**. She **never pays**: the
 live browser window is handed to you at the payment page so you pay yourself. No
 card numbers are ever handled or stored (she relies on the site's/browser's saved
@@ -238,7 +265,7 @@ no display she says *"I need your screen for that."*
 
 ## Real-world errands — flights, hotels, shopping (you do the last click)
 
-Beyond delivery, Aria runs errands end to end **except the final approval and
+Beyond delivery, Topol runs errands end to end **except the final approval and
 payment, which always happen in *your* own default browser** (whatever `xdg-open`
 launches — Firefox, Chrome, anything):
 
@@ -259,7 +286,7 @@ launches — Firefox, Chrome, anything):
   opens each piece (flight + hotel) for you to finish.
 
 No setup, no keys, no browser engine needed — these use smart deep links, so
-they're instant. Nothing is ever booked, bought, or paid by Aria; she opens pages,
+they're instant. Nothing is ever booked, bought, or paid by Topol; she opens pages,
 you do the very last thing.
 
 ---
@@ -317,7 +344,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md). The short version:
 
 ```bash
 aria/packaging/build_deb.sh               # version comes from aria.__version__
-# -> aria_0.8.0_amd64.deb  (~144 MB; ~440 MB installed)
+# -> aria_0.9.2_amd64.deb  (~144 MB; ~440 MB installed)
 ```
 
 The build (on a host with network) bundles a venv under `/opt/aria/venv` with the
@@ -344,9 +371,9 @@ uv run pytest             # unit tests + a mockable end-to-end voice-loop smoke 
   (`af_heart`, `am_michael`, …) have near-human prosody — the "doesn't sound like
   a robot" upgrade — and share a one-time ~340 MB download; classic Piper voices
   stay available as the lean/bundled option. All 100% local — no cloud TTS. If a
-  Kokoro voice is configured but its files are missing, Aria falls back to the
+  Kokoro voice is configured but its files are missing, Topol falls back to the
   bundled Piper voice instead of dying voiceless.
-- **Conversation mode** (`[conversation]`, on by default): after Aria answers,
+- **Conversation mode** (`[conversation]`, on by default): after Topol answers,
   the mic re-opens for ~6s so you can just keep talking — no wake word between
   turns. A fast-model relevance gate drops background speech (TV, side chatter)
   so she never butts in uninvited; set `enabled = false` for strict wake-word
@@ -357,10 +384,10 @@ uv run pytest             # unit tests + a mockable end-to-end voice-loop smoke 
   into a running summary the model keeps seeing), and at startup she recalls what
   your previous session was about — so "what were we talking about yesterday?"
   actually works.
-- **Notifications:** Aria uses your desktop's **native notification system**
-  (portable across distros via libnotify/`desktop-notifier`) — branded as "Aria"
+- **Notifications:** Topol uses your desktop's **native notification system**
+  (portable across distros via libnotify/`desktop-notifier`) — branded as "Topol"
   with its own icon. It never drives any one clock/reminder app.
-- **Free-tier resilience:** if Groq rate-limits you (its free daily cap), Aria says
+- **Free-tier resilience:** if Groq rate-limits you (its free daily cap), Topol says
   *"I've hit my usage limit — let's try again in a few minutes"* and keeps running
   (no crash). For a durable answer, configure a **free fallback provider** — when
   Groq is capped she switches to it automatically:

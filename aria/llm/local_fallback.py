@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from aria.llm.base import (
     ChatResult,
@@ -55,6 +55,10 @@ class LocalFallbackProvider(LLMProvider):
         self._base = base
         self._local = local  # injectable for tests; usually built on first use
         self._picks: dict | None = None
+        # Set by the session: called ONCE per switch so Aria can TELL the user
+        # she's on the slower local brain — silent multi-minute turns read as
+        # "broken", not "degraded".
+        self.on_switch: Callable[[], None] | None = None
 
     async def _local_ready(self) -> bool:
         if self._picks and self._picks.get("reasoning_model"):
@@ -71,13 +75,22 @@ class LocalFallbackProvider(LLMProvider):
             "until it recovers.",
             picks["reasoning_model"], picks["fast_model"],
         )
+        if self.on_switch is not None:
+            try:
+                self.on_switch()
+            except Exception:  # noqa: BLE001 - the announcement is cosmetic
+                pass
         return True
 
     def _map(self, model: str) -> str:
+        """EVERY fallback call runs on the small fast pick. The fallback is a
+        stopgap, and on a CPU the big local model turns each turn into minutes
+        of prompt-crunching — a quick decent answer beats a slow better one.
+        (Users who WANT the big local model pick provider=ollama as their main.)
+        """
         assert self._picks is not None
-        if model == self._fast:
-            return self._picks["fast_model"]
-        return self._picks["reasoning_model"]
+        del model
+        return self._picks["fast_model"]
 
     def _forget_local(self) -> None:
         """A local call failed (Ollama stopped?): re-detect next time."""

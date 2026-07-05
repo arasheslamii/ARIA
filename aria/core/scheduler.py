@@ -21,6 +21,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from aria import APP_NAME
 from aria.config.loader import state_dir
 
 _SCHEMA = """
@@ -111,7 +112,7 @@ def _build_icon(dn) -> object | None:  # noqa: ANN001 - the desktop_notifier mod
 async def desktop_notify(title: str, message: str) -> None:
     """Best-effort, BRANDED desktop notification that NEVER raises.
 
-    Shows "Aria" + the Aria icon (not a generic "python" banner). The icon is built
+    Shows the app name + icon (not a generic "python" banner). The icon is built
     as a proper ``Icon`` object and NO ``sound`` is passed — newer desktop-notifier
     expects ``Icon``/``Sound`` objects and crashes on a string/bool
     (``'… has no is_named'``). Any backend error is swallowed and logged so a flaky
@@ -121,7 +122,7 @@ async def desktop_notify(title: str, message: str) -> None:
         import desktop_notifier as dn
 
         icon = _build_icon(dn)
-        notifier_kwargs: dict = {"app_name": "Aria"}
+        notifier_kwargs: dict = {"app_name": APP_NAME}
         send_kwargs: dict = {"title": title, "message": message}
         if icon is not None:
             notifier_kwargs["app_icon"] = icon
@@ -133,7 +134,7 @@ async def desktop_notify(title: str, message: str) -> None:
         try:
             notifier = dn.DesktopNotifier(**notifier_kwargs)
         except TypeError:  # older versions name the args differently
-            notifier = dn.DesktopNotifier(app_name="Aria")
+            notifier = dn.DesktopNotifier(app_name=APP_NAME)
         try:
             await notifier.send(**send_kwargs)
         except TypeError:  # minimal fallback signature
@@ -266,7 +267,7 @@ class SchedulerService:
         if self._announce is not None:
             self._announce(text)
         if self._notify is not None:
-            await self._notify("Aria", f"⏰ {alarm.label}")
+            await self._notify(APP_NAME, f"⏰ {alarm.label}")
         nxt = self._next_occurrence(alarm)
         if nxt is None:
             await self._deactivate(alarm.id)

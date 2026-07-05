@@ -1,9 +1,12 @@
 """Long-term memory in SQLite.
 
-Two stores:
-  * facts  : key/value-ish durable facts and preferences (user name, "I prefer
-             celsius", "my dentist is Dr Lee"). Recalled across sessions.
-  * turns  : a rolling transcript log for context + future recall.
+Two stores with DIFFERENT lifetimes:
+  * facts  : durable facts and preferences the user explicitly asked to keep
+             (user name, "remember I'm vegetarian"). Persist across days.
+  * turns  : the conversation transcript — DAILY. Everything from before today
+             is purged on open and at the first turn of a new day, so each
+             morning starts fresh: no stale topics resurrected into greetings,
+             and no transcript quietly accumulating on disk (privacy).
 
 Short-term rolling context lives in the orchestrator; this is the persistent
 layer. All access is async via aiosqlite.
@@ -12,11 +15,17 @@ layer. All access is async via aiosqlite.
 from __future__ import annotations
 
 import time
+from datetime import date, datetime
 from pathlib import Path
 
 import aiosqlite
 
 from aria.config.loader import state_dir
+
+
+def _start_of_today() -> float:
+    now = datetime.now().astimezone()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -38,11 +47,20 @@ class Memory:
     def __init__(self, db_path: Path | None = None) -> None:
         self.db_path = db_path or (state_dir() / "memory.sqlite3")
         self._db: aiosqlite.Connection | None = None
+        self._purge_day: date | None = None
 
     async def open(self) -> None:
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+        await self.purge_old_turns()
+
+    async def purge_old_turns(self) -> None:
+        """Delete conversation turns from before today. Facts are untouched —
+        the user explicitly asked for those; the transcript they didn't."""
+        await self.db.execute("DELETE FROM turns WHERE created_at < ?", (_start_of_today(),))
+        await self.db.commit()
+        self._purge_day = date.today()
 
     async def close(self) -> None:
         if self._db:
@@ -80,6 +98,9 @@ class Memory:
 
     # --- turns ---------------------------------------------------------
     async def log_turn(self, role: str, content: str) -> None:
+        if self._purge_day != date.today():
+            # Day rolled over while the daemon stayed up: start the day fresh.
+            await self.purge_old_turns()
         await self.db.execute(
             "INSERT INTO turns(role, content, created_at) VALUES(?,?,?)",
             (role, content, time.time()),

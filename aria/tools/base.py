@@ -50,6 +50,9 @@ class Tool(ABC):
     # Optional narration spoken when a SLOW tool round-trip begins (so the voice
     # isn't silent during a multi-second browse). None -> the generic filler.
     slow_filler: str | None = None
+    # Long-running tools (browser agents) override the executor's default
+    # timeout, which is sized for quick lookups and would kill them mid-flight.
+    timeout_s: float | None = None
 
     @abstractmethod
     async def run(self, **kwargs: Any) -> ToolResult:

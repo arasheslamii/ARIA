@@ -49,6 +49,13 @@ DECLINED = (
     "Got it, cancelled.",
 )
 
+# Giving up on an unanswered/garbled confirmation instead of re-asking forever.
+DROPPED = (
+    "I'll leave that for now — just ask me again if you still want it.",
+    "Let's drop that one for the moment. Say the word if you want it back.",
+    "Okay, parking that. Ask again whenever.",
+)
+
 # A turn that would otherwise end silent.
 NO_RESPONSE = (
     "Sorry, I'm not sure how to help with that one.",

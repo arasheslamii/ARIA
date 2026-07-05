@@ -64,11 +64,11 @@ async def test_rate_limited_chat_runs_locally_with_mapped_models(monkeypatch):
     provider = LocalFallbackProvider(
         LimitedCloud(), fast_model="llama-3.1-8b-instant", local=local
     )
-    # A reasoning-model call maps to the biggest local tool-capable model...
+    # EVERY call maps to the small fast pick: the fallback is a stopgap, and
+    # the big local model on CPU means minutes per turn.
     out = await provider.chat([], model="llama-3.3-70b-versatile")
     assert out.content == "local answer"
-    assert local.chat_models == ["llama3.1:latest"]
-    # ...and a fast/router call maps to the small local pick.
+    assert local.chat_models == ["qwen2.5:3b"]
     await provider.chat([], model="llama-3.1-8b-instant")
     assert local.chat_models[-1] == "qwen2.5:3b"
     assert calls["n"] == 1  # detection ran once, then cached
@@ -82,7 +82,7 @@ async def test_offline_cloud_also_falls_back_and_streams_locally(monkeypatch):
     )
     text = "".join([d async for d in provider.stream([], model="llama-3.3-70b-versatile")])
     assert text == "local stream"
-    assert local.stream_models == ["llama3.1:latest"]
+    assert local.stream_models == ["qwen2.5:3b"]
 
 
 async def test_no_ollama_means_the_original_error_surfaces(monkeypatch):
@@ -175,3 +175,12 @@ def test_local_fallback_is_on_by_default_for_groq_users():
     from aria.config.schema import AriaConfig
 
     assert AriaConfig().llm.local_fallback is True
+
+
+async def test_fallback_prefers_the_small_fast_model_for_everything(monkeypatch):
+    # Big 8B on CPU = minutes per turn; the stopgap brain must be the snappy one.
+    _stub_detection(monkeypatch)
+    local = LocalSpy()
+    provider = LocalFallbackProvider(LimitedCloud(), fast_model="fast", local=local)
+    await provider.chat([], model="anything-at-all")
+    assert local.chat_models == ["qwen2.5:3b"]

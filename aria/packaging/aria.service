@@ -6,7 +6,7 @@
 #     aria enable          # == systemctl --user enable --now aria.service
 #     aria status / logs / stop / disable
 [Unit]
-Description=Aria — voice-first AI assistant (background daemon)
+Description=Topol — voice-first AI assistant (background daemon)
 # Wait for the user audio session AND network readiness so we don't crash-loop at
 # login/boot (DNS isn't up the instant WiFi associates). For --user units the
 # network-online.target ordering is best-effort, so the daemon ALSO treats a

@@ -128,9 +128,13 @@ class AudioConfig(BaseModel):
 class ConversationConfig(BaseModel):
     """Flowing conversation: after Aria speaks, the mic re-opens briefly with NO
     wake word so the user can just keep talking. A fast-LLM relevance gate drops
-    background speech (TV, side conversations) so she never butts in uninvited."""
+    background speech (TV, side conversations) so she never butts in uninvited.
 
-    enabled: bool = True
+    Default OFF (Siri-like): activate -> job done -> asleep. Every open-mic
+    second is a chance for room noise to become a ghost turn, and the reply
+    window after HER questions still opens regardless of this setting."""
+
+    enabled: bool = False
     # How long she listens for a follow-up before falling back to wake-word idle.
     # Kept SHORT on purpose: a long open mic feels like being watched, and every
     # extra second is another chance for background noise to become a ghost turn.

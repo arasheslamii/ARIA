@@ -233,3 +233,173 @@ def test_reserve_tools_are_confirm_gated_slow_and_in_the_prompt():
     assert hotel.slow_filler and flight.slow_filler  # no dead air for minutes
     assert {"reserve_hotel", "reserve_flight"} <= _SLOW_TOOLS
     assert "reserve_hotel" in ORCHESTRATOR_SYSTEM
+
+
+# --- 0.8.2: the reserve loop-of-confirmations bug ----------------------------
+async def test_executor_lets_long_tools_override_the_quick_timeout():
+    import asyncio as aio
+
+    from aria.core.executor import ExecConfig, ToolExecutor
+    from aria.safety.audit import AuditLog
+    from aria.tools.base import Tool, ToolResult
+
+    class SlowBrowse(Tool):
+        name = "slow_browse"
+        description = "x"
+        timeout_s = 5.0  # declares itself long-running
+
+        async def run(self, **kwargs):
+            await aio.sleep(0.3)  # longer than the executor default below
+            return ToolResult(content="done")
+
+    ex = ToolExecutor(AuditLog(), ExecConfig(timeout_s=0.05, retries=0,
+                                             require_confirmation=False))
+    res = await ex.execute(SlowBrowse(), {})
+    assert res.content == "done"  # NOT killed at the quick-lookup timeout
+
+
+def test_browser_tools_outlive_the_executor_default():
+    from aria.core.executor import ExecConfig
+    from aria.tools.commerce import BrowseWebTool, OrderFoodTool
+
+    default = ExecConfig().timeout_s
+    for tool in (
+        BrowseWebTool(dict),
+        OrderFoodTool(_commerce_cfg, dict),
+        ReserveHotelTool(_commerce_cfg, dict),
+        ReserveFlightTool(_commerce_cfg, dict),
+    ):
+        # Must exceed both the executor default AND the browse budget itself.
+        assert tool.timeout_s > default
+        assert tool.timeout_s > _commerce_cfg().max_seconds
+
+
+async def test_failed_confirmed_tool_is_never_reconfirmed_in_a_loop(tmp_path):
+    """The user's exact bug: reserve_hotel fails after the yes; the model retries
+    the same call, which re-triggered the confirmation question — forever."""
+    from aria.core.memory import Memory
+    from aria.core.orchestrator import Orchestrator
+    from aria.llm.base import ChatResult, ToolCall
+    from aria.tools.base import Tool, ToolRegistry
+    from tests.conftest import FakeLLM
+
+    class ExplodingReserve(Tool):
+        name = "reserve_hotel"
+        description = "reserve"
+        risk = "confirm"
+
+        def __init__(self) -> None:
+            self.runs = 0
+
+        async def run(self, **kwargs):
+            self.runs += 1
+            raise ToolError("the browsing engine is not installed")
+
+    reg = ToolRegistry()
+    tool = ExplodingReserve()
+    reg.register(tool)
+    call = ToolCall("c1", "reserve_hotel", {"destination": "Paris"})
+    retry = ToolCall("c2", "reserve_hotel", {"destination": "Paris"})
+    llm = FakeLLM(
+        stream_text="I couldn't run the booking browser — the engine failed.",
+        chat_queue=[
+            ChatResult(content='{"route":"tool","needs_tools":["reserve_hotel"],"reason":"x"}'),
+            ChatResult(content="", tool_calls=[call]),   # first plan -> gated
+            ChatResult(content="", tool_calls=[retry]),  # after failure: same call!
+            ChatResult(content="It failed."),            # forced honest wrap-up
+        ],
+    )
+    mem = Memory(":memory:")
+    await mem.open()
+    orch = Orchestrator(llm=llm, registry=reg, memory=mem,
+                        reasoning_model="big", fast_model="small")
+
+    first = "".join([d async for d in orch.respond("book the best hotel in paris")])
+    assert "go ahead" in first.lower()  # asked ONCE
+
+    second = "".join([d async for d in orch.respond("yes")])
+    assert tool.runs == 1  # ran once; the identical retry was refused
+    assert "go ahead" not in second.lower()  # and NEVER re-asked
+    assert orch._pending is None  # turn finished cleanly
+    assert "engine failed" in second  # the failure was reported out loud
+    await mem.close()
+
+
+# --- 0.8.3: no dead air after "yes", consent walls, visible failures ---------
+def test_browser_tasks_deal_with_consent_walls_first():
+    # Booking.com's GDPR dialog blocks EVERYTHING; the agent must be told.
+    assert "cookie/consent" in build_hotel_task("Paris", "2026-07-10", "2026-07-12")
+    assert "cookie/consent" in build_flight_task("EDI", "LHR", "2026-07-10")
+
+
+def test_plain_go_ahead_is_instant_but_amendments_still_classify():
+    from aria.core.orchestrator import _is_plain_go_ahead
+
+    for t in ("yes, find whatever you can", "sure go for it", "yeah do it please",
+              "okay whatever looks good"):
+        assert _is_plain_go_ahead(t), t
+    for t in ("yes but make it two nights", "yes, actually change the dates",
+              "no, find something cheaper", "yes add breakfast",
+              "leave it on channel four"):
+        assert not _is_plain_go_ahead(t), t
+
+
+async def test_long_emphatic_yes_needs_no_llm_and_runs_immediately(tmp_path):
+    """The live bug: 'yes find whatever you can' went to the confirmation
+    classifier — minutes of silence on the local fallback before anything ran."""
+    from aria.core.memory import Memory
+    from aria.core.orchestrator import Orchestrator
+    from aria.llm.base import ChatResult, ToolCall
+    from aria.tools.base import Tool, ToolRegistry, ToolResult
+    from tests.conftest import FakeLLM
+
+    class SpyReserve(Tool):
+        name = "reserve_hotel"
+        description = "reserve"
+        risk = "confirm"
+
+        def __init__(self) -> None:
+            self.runs = 0
+
+        async def run(self, **kwargs):
+            self.runs += 1
+            return ToolResult(content="reserved up to the payment step")
+
+    reg = ToolRegistry()
+    tool = SpyReserve()
+    reg.register(tool)
+    llm = FakeLLM(
+        stream_text="All set — it's on your screen.",
+        chat_queue=[
+            ChatResult(content='{"route":"tool","needs_tools":["reserve_hotel"],"reason":"x"}'),
+            ChatResult(content="", tool_calls=[ToolCall("c1", "reserve_hotel", {})]),
+            # NOTE: no classifier entry — if the yes went to the LLM, this queue
+            # would be consumed out of order and the test would fail.
+            ChatResult(content="Done — ready to pay."),
+        ],
+    )
+    mem = Memory(":memory:")
+    await mem.open()
+    orch = Orchestrator(llm=llm, registry=reg, memory=mem,
+                        reasoning_model="big", fast_model="small")
+    "".join([d async for d in orch.respond("book the best hotel in paris")])
+    out = "".join([d async for d in orch.respond("yes, find whatever you can")])
+    assert tool.runs == 1  # executed straight away, no classify round-trip
+    assert "go ahead" not in out.lower()
+    await mem.close()
+
+
+async def test_switch_to_local_brain_is_announced_once(monkeypatch):
+    import aria.llm.local_fallback as lf
+    from aria.llm.local_fallback import LocalFallbackProvider
+    from aria.llm.ollama import ModelInfo
+    from tests.test_local_fallback import LimitedCloud, LocalSpy
+
+    monkeypatch.setattr(lf, "detect_ollama",
+                        lambda base: [ModelInfo(name="qwen2.5:3b", params_b=3.1)])
+    provider = LocalFallbackProvider(LimitedCloud(), fast_model="fast", local=LocalSpy())
+    switches = []
+    provider.on_switch = lambda: switches.append(1)
+    await provider.chat([], model="big")
+    await provider.chat([], model="big")
+    assert switches == [1]  # told the user ONCE, not every call
